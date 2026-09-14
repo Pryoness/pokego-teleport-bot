@@ -1,0 +1,14 @@
+[Unit]
+Description=PokeGo Teleport Bot
+After=network.target
+
+[Service]
+Type=simple
+User=REPLACE_WITH_USERNAME
+WorkingDirectory=REPLACE_WITH_BOT_PATH
+ExecStart=REPLACE_WITH_BOT_PATH/venv/bin/python REPLACE_WITH_BOT_PATH/main.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
