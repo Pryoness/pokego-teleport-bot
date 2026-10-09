@@ -13,7 +13,7 @@ from config import config
 from stats import stats, haversine_km
 from queue_manager import queue, TargetTask
 from browser import SXBrowser
-from shundo import ShundoManager, parse_alert, parse_coords, species_matches_targets, normalize_species, _species_in
+from shundo import ShundoManager, parse_alert, parse_coords, species_matches_targets, normalize_species, _species_in, base_species
 from pokemon_data import is_valid_pokemon, get_sprite_url
 
 # Path for channel success rate log
@@ -59,6 +59,12 @@ class PokeBot:
         self._copy_lock = asyncio.Lock()  # Serialize PokeX Copy clicks
         self._pokex_coord_future = None  # Resolved by the ephemeral coords reply
         self._shundo_task_counter = 0
+        # Where the player actually was over time: [(epoch, "lat,lng"), ...]
+        # Used to attribute logged catches/flees to the right spot (the background
+        # scanner can see a catch 15 s+ late, after the bot already teleported elsewhere).
+        self._pos_history = []
+        if self.current_coords:
+            self._pos_history.append((stats._data.get("last_catch_time") or time.time(), self.current_coords))
         self._load_channel_stats()
         self._setup_events()
 
@@ -387,6 +393,7 @@ class PokeBot:
             stats._data.get("last_catch_time"),
             overhead=config.get("shundo_catch_overhead_seconds", 60),
             budget_s=config.get("shundo_plan_budget_seconds", 5),
+            anchors=stats.get_cooldown_anchors(),
         )
         if not plan:
             return None, None, None
@@ -429,7 +436,8 @@ class PokeBot:
             lines.append("DM intake is disabled (`shundo_dm_enabled`).")
         plan = self.shundos.plan(stats._data.get("last_catch_coords"), stats._data.get("last_catch_time"),
                                  overhead=config.get("shundo_catch_overhead_seconds", 60),
-                                 budget_s=config.get("shundo_plan_budget_seconds", 5))
+                                 budget_s=config.get("shundo_plan_budget_seconds", 5),
+                                 anchors=stats.get_cooldown_anchors())
         if plan:
             lines.append(f"Plan ({'exact' if self.shundos.last_plan_exhaustive else 'best found'}):")
             for i, e in enumerate(plan, 1):
@@ -457,6 +465,85 @@ class PokeBot:
                 lines.append(f"• {e['name']} ({e['city']}) — {e['status'].replace('_', ' ')}")
         lines.append(f"Channel feeds: {'on' if config.get('channel_watch_enabled', True) else 'off'}")
         return "\n".join(lines)[:1900]
+
+    # ───────────── position history + SX log timestamps ─────────────
+    def _record_position(self, coords, t=None):
+        if not coords:
+            return
+        self._pos_history.append((t or time.time(), coords))
+        if len(self._pos_history) > 500:
+            self._pos_history = self._pos_history[-300:]
+
+    def _coords_at(self, t):
+        """Where the player was at epoch t (last teleport at or before t)."""
+        best = None
+        for pt, c in self._pos_history:
+            if pt <= t + 1:
+                best = c
+            else:
+                break
+        return best
+
+    @staticmethod
+    def _log_line_epoch(line, now=None):
+        """SX log lines start with [HH:MM:SS] (server local time). Returns epoch or None."""
+        m = re.match(r"\s*\[(\d{1,2}):(\d{2}):(\d{2})\]", line or "")
+        if not m:
+            return None
+        import datetime as _dt
+        now = now or time.time()
+        n = _dt.datetime.fromtimestamp(now)
+        t = n.replace(hour=int(m.group(1)), minute=int(m.group(2)), second=int(m.group(3)), microsecond=0)
+        ep = t.timestamp()
+        if ep > now + 300:  # line from before midnight
+            ep -= 86400
+        return ep
+
+    def _find_catch_outcome(self, lines, dex, species, since):
+        """Scan SX log lines for this Pokémon's [CatchPokemon] outcome after `since`.
+        Returns (outcome, epoch, encounter_id) with outcome 'caught' / 'fled' / None."""
+        sp = base_species(species).replace("-", " ")
+        tag = f"(#{dex})" if dex else None
+        enc_id = None
+        outcome = None
+        when = None
+        for line in sorted(lines, key=lambda l: self._log_line_epoch(l) or 0):
+            ll = line.lower()
+            t = self._log_line_epoch(line)
+            if t is None or t < since - 2:
+                continue
+            hit = (tag and tag in ll) or (sp and sp in ll.replace("-", " ").replace(".", ""))
+            if not hit:
+                continue
+            if "[normalencounter]" in ll and "encounterid:" in ll:
+                m = re.search(r"EncounterId:\s*(\d+)", line)
+                if m:
+                    enc_id = m.group(1)
+            if "[catchpokemon]" in ll:
+                after = ll.split("[catchpokemon]", 1)[1].strip()
+                if after.startswith("caught"):
+                    outcome, when = "caught", t
+                elif " fled" in after:
+                    outcome, when = "fled", t
+                # "escaped!" = ball broke out, SX keeps throwing — not final
+        return outcome, when, enc_id
+
+    async def _confirm_shundo_outcome(self, task, baseline_lines, since, wait_s=30):
+        """After a shundo teleport, wait for SX's own [CatchPokemon] verdict."""
+        from pokemon_data import get_pokemon_id
+        dex = get_pokemon_id(base_species(task.pokemon))
+        deadline = time.time() + wait_s
+        while True:
+            try:
+                text = await self.browser.read_logs()
+            except Exception:
+                text = ""
+            lines = [l for l in (text or "").splitlines() if l not in baseline_lines]
+            outcome, when, enc_id = self._find_catch_outcome(lines, dex, task.pokemon, since)
+            if outcome or time.time() > deadline:
+                return outcome, when, enc_id
+            self.current_activity = f"Confirming catch for {display_name(task.pokemon)}…"
+            await asyncio.sleep(3)
 
     def _load_channel_stats(self):
         """Load per-channel success rate stats from disk."""
@@ -1316,6 +1403,16 @@ class PokeBot:
                             r'Caught.*?Pokemon\s+(.+?)\s+\(#(\d+)\)',
                             line, re.IGNORECASE
                         )
+                        flee_match = None if catch_match else re.search(
+                            r'\[CatchPokemon\].*?Pokemon\s+(.+?)\s+\(#(\d+)\)\s+fled',
+                            line, re.IGNORECASE
+                        )
+                        if flee_match:
+                            ft = self._log_line_epoch(line) or time.time()
+                            fc = self._coords_at(ft) or self.current_coords
+                            if fc:
+                                stats.record_flee_anchor(fc, at_time=ft, reason="fled")
+                                print(f"[BgScanner] Flee detected: {flee_match.group(1)} at {fc} — cooldown reset")
                         if catch_match:
                             dex_num = int(catch_match.group(2))
                             caught_name = get_name_by_id(dex_num) or catch_match.group(1).strip()
@@ -1347,9 +1444,13 @@ class PokeBot:
                                 if enc_id_match:
                                     nt_enc_id = enc_id_match.group(1)
                                 break
-                            # Use current coords if available, then fall back to last encounter coords,
-                            # then last known catch coords from stats
-                            coords = self.current_coords or self._last_encounter_coords
+                            # Attribute the catch to where the player WAS at the logged time
+                            # (this scanner can run 15 s+ after the catch, by which point the
+                            # worker may already have teleported somewhere else).
+                            line_t = self._log_line_epoch(line)
+                            coords = self._coords_at(line_t) if line_t else None
+                            if not coords:
+                                coords = self.current_coords or self._last_encounter_coords
                             if not coords:
                                 last_coords = stats._data.get("last_catch_coords")
                                 if last_coords:
@@ -1363,6 +1464,7 @@ class PokeBot:
                                 encounter_id=nt_enc_id,
                                 coords=coords,
                                 is_target=False,
+                                at_time=line_t,
                             )
                             # Start visible cooldown on dashboard (2hr max from distance chart)
                             # This is display-only; worker uses per-target distance cooldowns.
@@ -1750,7 +1852,6 @@ class PokeBot:
                     sw = getattr(self, "_shundo_wait", None)
                     if sw:
                         nxt, cd, dist, n_plan = sw
-                        self.current_coords = nxt["coords"]
                         self.current_activity = (f"Shundo cooldown — {nxt['name']}: {cd // 60}m {cd % 60}s "
                                                  f"({dist:.0f}km) • {n_plan} planned")
                         self.loop_step = 6
@@ -1928,7 +2029,9 @@ class PokeBot:
                 print(f"[Worker] Teleporting to {task.pokemon:12s} at {coords}")
                 self.current_activity = f"Teleporting to {display_name(task.pokemon)} at {coords}…"
                 self.loop_step = 3
+                teleport_started_at = time.time()
                 await self.browser.teleport(coords)
+                self._record_position(coords, teleport_started_at)
                 stats.record_teleport(task.pokemon, coords)
                 self._mark_recent_coords(coords)  # Prevent re-teleporting to same location
                 print(f"[Worker] Teleport complete")
@@ -1972,7 +2075,7 @@ class PokeBot:
                     return self.skip_current
 
                 result = await self.browser.check_logs_for(
-                    pokemon_name=task.pokemon,
+                    pokemon_name=base_species(task.pokemon) if getattr(task, "shundo_id", None) else task.pokemon,
                     timeout=monitor_timeout,
                     catch_patterns=catch_patterns,
                     fled_patterns=fled_patterns,
@@ -2191,6 +2294,8 @@ class PokeBot:
                 elif result["fled"]:
                     self.current_activity = f"{display_name(task.pokemon)} fled. Moving to next target…"
                     stats.record_fled(task.pokemon)
+                    if not getattr(task, "shundo_id", None):  # shundo path records it from the log time
+                        stats.record_flee_anchor(coords, reason="fled")
                     queue.mark_done(task)
                     print(f"[Worker] {task.pokemon} fled.")
 
@@ -2303,12 +2408,27 @@ class PokeBot:
                     print(f"[Worker] No log result for {task.pokemon} after {monitor_timeout}s — moving to next target")
 
                 if getattr(task, "shundo_id", None):
-                    shundo_caught = bool(result.get("caught")) or any(
-                        enc.get("shiny") and enc.get("iv_percent", 0) == 100
-                        and normalize_species(enc.get("pokemon", "")) == task.pokemon
-                        for enc in result.get("new_encounters", [])
-                    )
-                    self._shundo_finish(task, mon_status, shundo_caught)
+                    # Use SX's own [CatchPokemon] verdict — an encounter is NOT a catch.
+                    outcome, when, enc_id = await self._confirm_shundo_outcome(
+                        task, baseline_logs, teleport_started_at,
+                        wait_s=0 if mon_status == "no_result" else 30)
+                    if outcome == "caught":
+                        stats.record_caught(task.pokemon, cp=result.get("cp"), iv=result.get("iv"),
+                                            shiny=True, iv_percent=100, encounter_id=enc_id,
+                                            coords=coords, is_target=True, at_time=when)
+                        print(f"[Shundo] Confirmed catch of {task.pokemon} at {coords} "
+                              f"({time.strftime('%H:%M:%S', time.localtime(when))}) — cooldown from here")
+                    elif outcome == "fled":
+                        stats.record_flee_anchor(coords, at_time=when, reason="fled")
+                        if mon_status != "fled":
+                            stats.record_fled(task.pokemon)
+                        print(f"[Shundo] {task.pokemon} FLED at {coords} — treating as cooldown reset")
+                        mon_status = "fled"
+                    elif mon_status != "no_result":
+                        # Saw the encounter but no verdict: assume a catch may have happened here
+                        stats.record_flee_anchor(coords, at_time=time.time(), reason="unconfirmed", reset=False)
+                        print(f"[Shundo] {task.pokemon}: no catch/flee line — adding a safety cooldown from {coords}")
+                    self._shundo_finish(task, mon_status, outcome == "caught")
                 print(f"[Worker] Target {task.pokemon} done — checking queue for next catchable target")
 
             except Exception as e:

@@ -268,3 +268,10 @@ New config keys: `channel_watch_enabled`, `shundo_dm_enabled`, `shundo_dm_channe
 - Rules: empty list = hunt every Pokémon; otherwise hunt the non-skipped targets; if every target is skipped, hunt every Pokémon **except** the skipped ones.
 - Skipped Pokémon are never auto-removed after catches; Skip and Solo are mutually exclusive.
 - Config key `skip_pokemon`; API `POST /api/targets/{name}/skip`; Discord `@bot skip <a, b>` / `@bot unskip <a>`.
+
+### Catch cooldown accuracy (flee fix)
+- Shundo outcomes are confirmed from SX's own `[CatchPokemon]` lines ("Caught …" / "… fled"); the catch is recorded immediately with the shundo's coords and the logged time, before planning the next move.
+- The background scanner attributes catches/flees to where the player was at the logged `[HH:MM:SS]` time (position history), not wherever the bot is when it notices.
+- A flee counts as a cooldown reset (`flee_resets_cooldown`): cooldown restarts from the flee time, from both the flee spot and the last real catch spot.
+- Cooldown = chart value + `cooldown_safety_seconds` (30). Optional `cooldown_safety_percent` and `cooldown_round_up`.
+- Regional forms (e.g. Meowth-Alola) are matched by base species / dex number in SX logs.

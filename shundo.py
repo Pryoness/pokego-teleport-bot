@@ -38,6 +38,18 @@ def normalize_species(name):
     return s
 
 
+_FORM_SUFFIXES = ("-alola", "-alolan", "-galar", "-galarian", "-hisui", "-hisuian", "-paldea", "-paldean")
+
+
+def base_species(name):
+    """'meowth-alola' -> 'meowth' (SX logs only show the base name + dex number)."""
+    s = normalize_species(name)
+    for suf in _FORM_SUFFIXES:
+        if s.endswith(suf):
+            return s[: -len(suf)]
+    return s
+
+
 def parse_alert(content):
     """Parse one PokeX alert message. Returns dict or None if not an alert."""
     if not content or "<t:" not in content:
@@ -105,23 +117,30 @@ def species_matches_targets(species, targets, skipped=None):
 
 # ─────────────────────────── planner ───────────────────────────
 
-def _catch_time(free_at, last_pos, last_time, target_pos, overhead):
-    """Earliest time a catch at target_pos can complete."""
-    if last_pos is None or last_time is None:
-        ready = free_at
-    else:
-        cd = get_cooldown_for_distance(haversine_km(last_pos[0], last_pos[1], target_pos[0], target_pos[1]))
-        ready = max(free_at, last_time + cd) if (free_at - last_time) < MAX_COOLDOWN else free_at
+def _catch_time(free_at, anchors, target_pos, overhead):
+    """Earliest time a catch at target_pos can complete.
+    anchors: list of ((lat,lng), epoch) cooldown origins (last catch, flees, resets).
+    The catch is allowed only once EVERY anchor's distance cooldown has elapsed."""
+    ready = free_at
+    for apos, at in anchors or ():
+        if apos is None or at is None or (free_at - at) >= MAX_COOLDOWN:
+            continue
+        cd = get_cooldown_for_distance(haversine_km(apos[0], apos[1], target_pos[0], target_pos[1]))
+        ready = max(ready, at + cd)
     return ready + overhead
 
 
-def plan_route(items, last_catch, last_catch_time, now, overhead=60, budget_s=5.0):
+def plan_route(items, last_catch, last_catch_time, now, overhead=60, budget_s=5.0, anchors=None):
     """Exact max-catch ordering.
 
     items: list of (key, (lat,lng), expires_at)
     last_catch: (lat,lng) or None;  last_catch_time: epoch or None
+    anchors: optional list of ((lat,lng), epoch) — overrides last_catch/last_catch_time
     Returns (order_keys, finish_time, exhaustive: bool)
     """
+    if anchors is None:
+        anchors = [(last_catch, last_catch_time)] if last_catch and last_catch_time else []
+    anchors = tuple(anchors)
     n = len(items)
     if n == 0:
         return [], now, True
@@ -131,26 +150,26 @@ def plan_route(items, last_catch, last_catch_time, now, overhead=60, budget_s=5.
 
     # Seed with greedy (nearest catchable next) so a budget cut-off still has a good answer
     def greedy():
-        order, free, lp, lt = [], now, last_catch, last_catch_time
+        order, free, anc = [], now, anchors
         left = set(range(n))
         while True:
             best = None
             for j in left:
-                ct = _catch_time(free, lp, lt, pos[j], overhead)
+                ct = _catch_time(free, anc, pos[j], overhead)
                 if ct <= exp[j] and (best is None or ct < best[0]):
                     best = (ct, j)
             if not best:
                 return order, free
             ct, j = best
             order.append(j); left.discard(j)
-            free, lp, lt = ct, pos[j], ct
+            free, anc = ct, ((pos[j], ct),)
 
     g_order, g_finish = greedy()
     best = {"count": len(g_order), "finish": g_finish, "order": list(g_order)}
     seen = {}  # (last_idx, frozenset(done)) -> earliest time reached
     exhaustive = [True]
 
-    def dfs(order, done, free, lp, lt, last_idx):
+    def dfs(order, done, free, anc, last_idx):
         if time.time() > deadline:
             exhaustive[0] = False
             return
@@ -170,18 +189,18 @@ def plan_route(items, last_catch, last_catch_time, now, overhead=60, budget_s=5.
         for j in range(n):
             if j in done:
                 continue
-            ct = _catch_time(free, lp, lt, pos[j], overhead)
+            ct = _catch_time(free, anc, pos[j], overhead)
             if ct <= exp[j]:
                 cands.append((ct, j))
         cands.sort()
         for ct, j in cands:
             order.append(j)
-            dfs(order, done | {j}, ct, pos[j], ct, j)
+            dfs(order, done | {j}, ct, ((pos[j], ct),), j)
             order.pop()
             if not exhaustive[0]:
                 return
 
-    dfs([], frozenset(), now, last_catch, last_catch_time, -1)
+    dfs([], frozenset(), now, anchors, -1)
     return [items[j][0] for j in best["order"]], best["finish"], exhaustive[0]
 
 
@@ -298,12 +317,16 @@ class ShundoManager:
         self.log("caught", e)
 
     def mark_caught_by_name(self, species, coords):
+        return self._mark_by_name(species, coords)
+
+    def _mark_by_name(self, species, coords):
         """Called when the background scanner sees a catch. Matches a pending/processing
         shundo of the same species within ~2 km of the catch coords."""
         sp = normalize_species(species)
         best = None
         for e in self.entries.values():
-            if e["status"] not in ("pending", "processing") or not e.get("coords") or e["species"] != sp:
+            if (e["status"] not in ("pending", "processing") or not e.get("coords")
+                    or base_species(e["species"]) != base_species(sp)):
                 continue
             d = 0.0
             if coords:
@@ -345,19 +368,23 @@ class ShundoManager:
                    for e in self.entries.values())
 
     # ── planning ──
-    def plan(self, last_catch_coords, last_catch_time, overhead=60, budget_s=5.0, force=False):
-        """Return ordered list of pending entries (best catch order). Marks unreachable ones."""
+    def plan(self, last_catch_coords, last_catch_time, overhead=60, budget_s=5.0, force=False, anchors=None):
+        """Return ordered list of pending entries (best catch order). Marks unreachable ones.
+        anchors: list of ((lat,lng), epoch) cooldown origins; defaults to the last catch."""
         now = time.time()
         pend = self.pending()
         lc = (last_catch_coords["lat"], last_catch_coords["lng"]) if last_catch_coords else None
         lct = last_catch_time or None
-        sig = (tuple(sorted(e["msg_id"] for e in pend)), lc, lct)
+        if anchors is None:
+            anchors = [(lc, lct)] if lc and lct else []
+        anchors = tuple((tuple(a), float(t)) for a, t in anchors)
+        sig = (tuple(sorted(e["msg_id"] for e in pend)), anchors)
         if (not force and self._plan_cache and self._plan_cache[0] == sig
                 and now - self._plan_cache[3] < 30):
             order_ids, exhaustive = self._plan_cache[1], self._plan_cache[2]
         else:
             items = [(e["msg_id"], _latlng(e["coords"]), e["expires_at"]) for e in pend]
-            order_ids, _finish, exhaustive = plan_route(items, lc, lct, now, overhead, budget_s)
+            order_ids, _finish, exhaustive = plan_route(items, lc, lct, now, overhead, budget_s, anchors=anchors)
             self._plan_cache = (sig, order_ids, exhaustive, now)
             # Items left out of the plan stay pending (they're only removed when DSP hits 0);
             # log once when one can't be reached in time from the current catch spot.
@@ -365,7 +392,7 @@ class ShundoManager:
                 e["in_plan"] = e["msg_id"] in order_ids
                 if e["in_plan"]:
                     continue
-                ct = _catch_time(now, lc, lct, _latlng(e["coords"]), overhead)
+                ct = _catch_time(now, anchors, _latlng(e["coords"]), overhead)
                 e["reachable"] = ct <= e["expires_at"]
                 if not e["reachable"] and not e.get("_unreach_logged"):
                     e["_unreach_logged"] = True

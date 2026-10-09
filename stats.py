@@ -63,13 +63,41 @@ def haversine_km(lat1, lon1, lat2, lon2):
     return R * c
 
 
-def get_cooldown_for_distance(distance_km):
-    """Look up cooldown time based on distance from last catch."""
-    cooldown = MAX_COOLDOWN  # Default to max
-    for min_dist, cd_seconds in COOLDOWN_CHART:
+def _safety():
+    """(percent, seconds, round_up) safety settings from config (lazy import avoids a cycle)."""
+    try:
+        from config import config
+        return (float(config.get("cooldown_safety_percent", 0)),
+                float(config.get("cooldown_safety_seconds", 30)),
+                bool(config.get("cooldown_round_up", False)))
+    except Exception:
+        return 0.0, 30.0, False
+
+
+def get_raw_cooldown_for_distance(distance_km, round_up=True):
+    """Chart value. round_up=True uses the NEXT chart step when the distance falls
+    between two steps (e.g. 17.9 km -> the 18 km value, not the 12 km value)."""
+    if distance_km <= 0:
+        return COOLDOWN_CHART[0][1]
+    floor_cd = COOLDOWN_CHART[0][1]
+    for i, (min_dist, cd_seconds) in enumerate(COOLDOWN_CHART):
         if distance_km >= min_dist:
-            cooldown = cd_seconds
-    return min(cooldown, MAX_COOLDOWN)
+            floor_cd = cd_seconds
+            if distance_km == min_dist:
+                return min(cd_seconds, MAX_COOLDOWN)
+        else:
+            return min(cd_seconds if round_up else floor_cd, MAX_COOLDOWN)
+    return MAX_COOLDOWN
+
+
+def get_cooldown_for_distance(distance_km):
+    """Cooldown required between two catches distance_km apart, with safety margin.
+    = chart (rounded up to the next step) * (1 + safety%) + safety seconds, max 2 h."""
+    pct, pad, round_up = _safety()
+    base = get_raw_cooldown_for_distance(distance_km, round_up=round_up)
+    if base >= MAX_COOLDOWN:
+        return MAX_COOLDOWN
+    return int(min(MAX_COOLDOWN, base * (1 + pct / 100.0) + pad))
 
 
 class StatsTracker:
@@ -317,19 +345,27 @@ class StatsTracker:
                 self._add_event("encounter", f"Encountered {display}{shiny_str}{target_str} — {cp or '?'}cp, IV: {iv_str}, shiny={shiny}")
         self.save()
 
-    def record_caught(self, pokemon, cp=None, iv=None, shiny=False, iv_percent=0, encounter_id=None, coords=None, is_target=True):
+    def record_caught(self, pokemon, cp=None, iv=None, shiny=False, iv_percent=0, encounter_id=None, coords=None, is_target=True, at_time=None):
         with self._lock:
             now = time.time()
-            # ALWAYS update last catch coords for cooldown — even if this encounter
-            # was already counted in stats. The cooldown must reflect the most recent
-            # catch location, regardless of stat dedup.
-            if coords:
+            catch_t = float(at_time) if at_time else now
+            # Update last catch coords for cooldown — even if this encounter was already
+            # counted in stats — but never let an older/late report overwrite a newer catch
+            # (the background scanner can report a catch 15 s+ after it happened).
+            if coords and catch_t >= (self._data.get("last_catch_time") or 0) - 1:
                 try:
                     parts = coords.replace(",", " ").split()
                     lat = float(parts[0])
                     lng = float(parts[1])
-                    self._data["last_catch_coords"] = {"lat": lat, "lng": lng}
-                    self._data["last_catch_time"] = now
+                    same_catch = (encounter_id and encounter_id == self._data.get("last_catch_encounter_id"))
+                    if not same_catch:
+                        self._data["last_catch_coords"] = {"lat": lat, "lng": lng}
+                        self._data["last_catch_time"] = catch_t
+                        self._data["last_catch_encounter_id"] = encounter_id
+                        # A successful catch starts a fresh cooldown: older flee anchors no longer apply
+                        self._data["cooldown_anchors"] = [
+                            a for a in self._data.get("cooldown_anchors", []) if a.get("t", 0) > catch_t
+                        ]
                 except (ValueError, IndexError):
                     pass
             # Deduplicate catches — skip stat counting if already recorded,
@@ -423,6 +459,50 @@ class StatsTracker:
         """Legacy: kept for backward compat. Use per-target cooldown checking instead."""
         pass
 
+    # ── extra cooldown anchors (flees) ──
+    def record_flee_anchor(self, coords, at_time=None, reason="fled", reset=None):
+        """A catch attempt that fled (catching too early) is treated as a cooldown reset:
+        the cooldown now runs from the flee time, both from the flee spot AND from the
+        last real catch spot (whichever needs longer wins)."""
+        t = float(at_time) if at_time else time.time()
+        if reset is None:
+            try:
+                from config import config
+                reset = config.get("flee_resets_cooldown", True)
+            except Exception:
+                reset = True
+        try:
+            parts = coords.replace(",", " ").split()
+            flat, flng = float(parts[0]), float(parts[1])
+        except Exception:
+            return
+        with self._lock:
+            anchors = [a for a in self._data.get("cooldown_anchors", []) if t - a.get("t", 0) < MAX_COOLDOWN]
+            # same event reported twice (worker + background scanner) -> keep one
+            for a in anchors:
+                if abs(a.get("t", 0) - t) < 15 and a.get("why") == reason:
+                    return
+            anchors.append({"lat": flat, "lng": flng, "t": t, "why": reason})
+            lc = self._data.get("last_catch_coords")
+            if reset and lc and self._data.get("last_catch_time"):
+                anchors.append({"lat": lc["lat"], "lng": lc["lng"], "t": t, "why": f"{reason}-reset"})
+            self._data["cooldown_anchors"] = anchors[-20:]
+            self._add_event("cooldown", f"Cooldown reset by {reason} at {flat:.4f},{flng:.4f}")
+        self.save()
+
+    def get_cooldown_anchors(self):
+        """All active cooldown origins as [((lat,lng), epoch), ...] (last catch + flee resets)."""
+        now = time.time()
+        with self._lock:
+            out = []
+            lc, lt = self._data.get("last_catch_coords"), self._data.get("last_catch_time")
+            if lc and lt and now - lt < MAX_COOLDOWN:
+                out.append(((lc["lat"], lc["lng"]), float(lt)))
+            for a in self._data.get("cooldown_anchors", []):
+                if now - a.get("t", 0) < MAX_COOLDOWN:
+                    out.append(((a["lat"], a["lng"]), float(a["t"])))
+            return out
+
     def get_catch_cooldown_for_target(self, target_coords):
         """Calculate required cooldown (seconds) based on distance from last catch to target.
         Returns 0 if no catch has been made or 2+ hours have passed since last catch.
@@ -447,24 +527,32 @@ class StatsTracker:
                     return 0
             except (ValueError, IndexError, TypeError):
                 return 0
-            # After 2 hours, no cooldown regardless of distance
-            elapsed = time.time() - last_catch_time
-            if elapsed >= MAX_COOLDOWN:
-                return 0
-            try:
-                distance = haversine_km(
-                    last_coords["lat"], last_coords["lng"],
-                    target_lat, target_lng
-                )
-                required = get_cooldown_for_distance(distance)
-                # Return remaining time (required - elapsed)
-                remaining = required - elapsed
-                return max(0, int(remaining))
-            except Exception as e:
-                print(f"[Stats] Error calculating target cooldown: {e}")
-                return 0
+            anchors = [((last_coords["lat"], last_coords["lng"]), float(last_catch_time))]
+            anchors += [((a["lat"], a["lng"]), float(a["t"])) for a in self._data.get("cooldown_anchors", [])]
+        now = time.time()
+        remaining = 0
+        try:
+            for (alat, alng), at in anchors:
+                elapsed = now - at
+                if elapsed >= MAX_COOLDOWN:  # after 2 h, no cooldown regardless of distance
+                    continue
+                required = get_cooldown_for_distance(haversine_km(alat, alng, target_lat, target_lng))
+                remaining = max(remaining, required - elapsed)
+            return max(0, int(remaining))
+        except Exception as e:
+            print(f"[Stats] Error calculating target cooldown: {e}")
+            return 0
 
     def get_catch_cooldown_info(self, target_coords=None):
+        """Dashboard cooldown info, including flee-reset anchors."""
+        info = self._cooldown_info_base(target_coords)
+        if target_coords:
+            rem = self.get_catch_cooldown_for_target(target_coords)
+            if rem > info.get("remaining_seconds", 0):
+                info.update(active=True, remaining_seconds=int(rem), reason="Flee reset cooldown")
+        return info
+
+    def _cooldown_info_base(self, target_coords=None):
         """Get cooldown info for dashboard display.
         Returns dict with distance, required_cooldown, remaining, last_catch_coords.
         Accepts either a tuple (lat, lng) or a string 'lat,lng'."""
@@ -511,6 +599,7 @@ class StatsTracker:
             self._data["cooldown_until"] = 0
             self._data["last_catch_coords"] = None
             self._data["last_catch_time"] = 0
+            self._data["cooldown_anchors"] = []
             self._add_event("cooldown", "Catch cooldown cleared")
         self.save()
 
@@ -519,6 +608,7 @@ class StatsTracker:
         Allows the bot to respect cooldown from a catch that happened before startup."""
         with self._lock:
             self._data["last_catch_coords"] = {"lat": lat, "lng": lng}
+            self._data["cooldown_anchors"] = []
             if catch_time is not None:
                 self._data["last_catch_time"] = catch_time
             else:

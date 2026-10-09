@@ -53,6 +53,11 @@ DEFAULTS = {
     "shundo_monitor_timeout_seconds": 45,  # how long to watch logs after a shundo teleport
     "shundo_plan_budget_seconds": 5,  # safety time limit for the exact planner
     "shundo_pause_queue": True,  # pause the regular queue while shundos are pending
+    # ── Catch cooldown safety ──
+    "cooldown_round_up": False,  # True = between chart steps, use the NEXT step's time
+    "cooldown_safety_percent": 0,  # extra % on top of the chart time
+    "cooldown_safety_seconds": 30,  # extra seconds on top of the chart time
+    "flee_resets_cooldown": True,  # a flee restarts the cooldown (from the flee time)
 }
 
 
