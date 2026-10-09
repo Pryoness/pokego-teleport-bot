@@ -222,6 +222,26 @@ async def index():
 
 # --- API Routes (must come before SPA fallback) ---
 
+def _cooldown_info_with_next(bot, current_coords):
+    """Cooldown box data: catch-anywhere countdown + the next planned shundo."""
+    info = stats.get_catch_cooldown_info(current_coords)
+    try:
+        plan = list(getattr(getattr(bot, "shundos", None), "last_plan", []) or [])
+        nxt = next((e for e in plan if e.get("status") == "pending" and e.get("coords")), None)
+        if nxt:
+            dist = bot._distance_from_last_catch(nxt["coords"]) if bot else None
+            info["next_target"] = {
+                "name": nxt.get("name"),
+                "coords": nxt.get("coords"),
+                "distance_km": round(dist, 1) if dist is not None else None,
+                "remaining_seconds": int(stats.get_catch_cooldown_for_target(nxt["coords"])),
+                "dsp_seconds": max(0, int(nxt.get("expires_at", 0) - time.time())),
+            }
+    except Exception as e:
+        info["next_target_error"] = str(e)
+    return info
+
+
 @app.get("/api/status")
 async def api_status():
     bot = getattr(app.state, "bot", None)
@@ -234,7 +254,7 @@ async def api_status():
         "running": running,
         "in_cooldown": stats.is_in_cooldown(),
         "cooldown_remaining": stats.cooldown_remaining(),
-        "catch_cooldown_info": stats.get_catch_cooldown_info(current_coords),
+        "catch_cooldown_info": _cooldown_info_with_next(bot, current_coords),
         "current_coords": current_coords,
         "queue_size": queue.size(),
         "targets": config.get_targets(),

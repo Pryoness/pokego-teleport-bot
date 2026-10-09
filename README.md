@@ -275,3 +275,9 @@ New config keys: `channel_watch_enabled`, `shundo_dm_enabled`, `shundo_dm_channe
 - A flee counts as a cooldown reset (`flee_resets_cooldown`): cooldown restarts from the flee time, from both the flee spot and the last real catch spot.
 - Cooldown = chart value + `cooldown_safety_seconds` (30). Optional `cooldown_safety_percent` and `cooldown_round_up`.
 - Regional forms (e.g. Meowth-Alola) are matched by base species / dex number in SX logs.
+
+### Freeze watchdog, interpolated cooldowns, cooldown box
+- SX logs an `[Encounter]` check about every 30 s. If nothing arrives for `freeze_silence_seconds` (180), the game is treated as frozen: no teleports, SX game restart, wait `freeze_restart_wait_seconds` (240), retry up to `freeze_max_restarts` (3), then pause and DM.
+- Cooldown between chart steps is proportional (`cooldown_interpolate`, default on): 891 km -> ~91 min, plus `cooldown_safety_seconds`.
+- The SX log page puts time, module and message on separate lines; the parser handles that and the one-line Copy format.
+- The dashboard cooldown box counts down to "catch anywhere" after every catch or flee and shows the next planned shundo with its own countdown.

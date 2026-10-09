@@ -64,37 +64,39 @@ def haversine_km(lat1, lon1, lat2, lon2):
 
 
 def _safety():
-    """(percent, seconds, round_up) safety settings from config (lazy import avoids a cycle)."""
+    """(percent, seconds, mode) from config. mode: 'interpolate' | 'round_up' | 'floor'."""
     try:
         from config import config
+        mode = "round_up" if config.get("cooldown_round_up", False) else (
+            "interpolate" if config.get("cooldown_interpolate", True) else "floor")
         return (float(config.get("cooldown_safety_percent", 0)),
-                float(config.get("cooldown_safety_seconds", 30)),
-                bool(config.get("cooldown_round_up", False)))
+                float(config.get("cooldown_safety_seconds", 30)), mode)
     except Exception:
-        return 0.0, 30.0, False
+        return 0.0, 30.0, "interpolate"
 
 
-def get_raw_cooldown_for_distance(distance_km, round_up=True):
-    """Chart value. round_up=True uses the NEXT chart step when the distance falls
-    between two steps (e.g. 17.9 km -> the 18 km value, not the 12 km value)."""
-    if distance_km <= 0:
+def get_raw_cooldown_for_distance(distance_km, mode="interpolate"):
+    """Chart value for a distance.
+    floor       = value of the step at or below the distance (old behaviour)
+    interpolate = proportional between the two surrounding steps (891 km -> ~91 min)
+    round_up    = value of the next step up"""
+    if distance_km <= COOLDOWN_CHART[0][0]:
         return COOLDOWN_CHART[0][1]
-    floor_cd = COOLDOWN_CHART[0][1]
-    for i, (min_dist, cd_seconds) in enumerate(COOLDOWN_CHART):
-        if distance_km >= min_dist:
-            floor_cd = cd_seconds
-            if distance_km == min_dist:
-                return min(cd_seconds, MAX_COOLDOWN)
-        else:
-            return min(cd_seconds if round_up else floor_cd, MAX_COOLDOWN)
+    for (d0, c0), (d1, c1) in zip(COOLDOWN_CHART, COOLDOWN_CHART[1:]):
+        if d0 <= distance_km < d1:
+            if mode == "floor":
+                return c0
+            if mode == "round_up":
+                return c1
+            return c0 + (distance_km - d0) / (d1 - d0) * (c1 - c0)
     return MAX_COOLDOWN
 
 
 def get_cooldown_for_distance(distance_km):
     """Cooldown required between two catches distance_km apart, with safety margin.
     = chart (rounded up to the next step) * (1 + safety%) + safety seconds, max 2 h."""
-    pct, pad, round_up = _safety()
-    base = get_raw_cooldown_for_distance(distance_km, round_up=round_up)
+    pct, pad, mode = _safety()
+    base = get_raw_cooldown_for_distance(distance_km, mode=mode)
     if base >= MAX_COOLDOWN:
         return MAX_COOLDOWN
     return int(min(MAX_COOLDOWN, base * (1 + pct / 100.0) + pad))
@@ -550,6 +552,21 @@ class StatsTracker:
             rem = self.get_catch_cooldown_for_target(target_coords)
             if rem > info.get("remaining_seconds", 0):
                 info.update(active=True, remaining_seconds=int(rem), reason="Flee reset cooldown")
+        # "Catch anywhere" countdown: time until every cooldown origin is 2 h old
+        now = time.time()
+        latest, why = 0.0, None
+        with self._lock:
+            lt = self._data.get("last_catch_time") or 0
+            if lt:
+                latest, why = float(lt), "catch"
+            for a in self._data.get("cooldown_anchors", []):
+                if a.get("t", 0) > latest and not str(a.get("why", "")).startswith("unconfirmed"):
+                    latest, why = float(a["t"]), a.get("why", "fled")
+        anywhere = max(0, int(latest + MAX_COOLDOWN - now)) if latest else 0
+        info["anywhere_remaining_seconds"] = anywhere
+        info["anywhere_total_seconds"] = MAX_COOLDOWN
+        info["anchor_reason"] = why
+        info["anchor_age_seconds"] = int(now - latest) if latest else None
         return info
 
     def _cooldown_info_base(self, target_coords=None):

@@ -54,10 +54,16 @@ DEFAULTS = {
     "shundo_plan_budget_seconds": 5,  # safety time limit for the exact planner
     "shundo_pause_queue": True,  # pause the regular queue while shundos are pending
     # ── Catch cooldown safety ──
-    "cooldown_round_up": False,  # True = between chart steps, use the NEXT step's time
+    "cooldown_interpolate": True,  # between chart steps, scale proportionally (891 km -> ~91 min)
+    "cooldown_round_up": False,  # True = between chart steps, use the NEXT step's time (strictest)
     "cooldown_safety_percent": 0,  # extra % on top of the chart time
     "cooldown_safety_seconds": 30,  # extra seconds on top of the chart time
     "flee_resets_cooldown": True,  # a flee restarts the cooldown (from the flee time)
+    # ── Game freeze watchdog (SX logs an [Encounter] check every ~30 s) ──
+    "freeze_watchdog_enabled": True,
+    "freeze_silence_seconds": 180,  # no encounter activity this long = game frozen -> restart
+    "freeze_restart_wait_seconds": 240,  # wait this long after a restart before trying again
+    "freeze_max_restarts": 3,  # then pause the bot and DM you
 }
 
 

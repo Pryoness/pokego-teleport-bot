@@ -63,6 +63,12 @@ class PokeBot:
         # Used to attribute logged catches/flees to the right spot (the background
         # scanner can see a catch 15 s+ late, after the bot already teleported elsewhere).
         self._pos_history = []
+        self._seen_flees = set()
+        self._last_game_heartbeat = time.time()  # last SX [Encounter]/[NormalEncounter] line
+        self._game_frozen = False
+        self._watchdog_restarts = 0
+        self._watchdog_last_restart = 0
+        self._notify_channel = None
         if self.current_coords:
             self._pos_history.append((stats._data.get("last_catch_time") or time.time(), self.current_coords))
         self._load_channel_stats()
@@ -84,7 +90,92 @@ class PokeBot:
             config.get("dm_delay_max_seconds", 7)
         )
         await asyncio.sleep(delay)
-        await user.send(message)
+        try:
+            await user.send(message)
+        except Exception:
+            self._notify_channel = None  # force a fresh lookup next time
+            raise
+
+    async def _get_notify_target(self, user_id):
+        """Cached DM channel for notifications. Re-fetching the user profile every time
+        sometimes returns 403 (40001) for user accounts; reusing the channel avoids it."""
+        ch = getattr(self, "_notify_channel", None)
+        if ch is not None:
+            return ch
+        user = self.client.get_user(int(user_id))
+        if user is None:
+            user = await self.client.fetch_user(int(user_id))
+        ch = user.dm_channel or await user.create_dm()
+        self._notify_channel = ch
+        return ch
+
+    async def _notify_user(self, message):
+        nid = config.get("notify_user_id")
+        if not nid:
+            return False
+        try:
+            await self._dm(await self._get_notify_target(nid), message)
+            return True
+        except Exception as e:
+            print(f"[Notify] DM failed: {e}")
+            return False
+
+    async def _freeze_watchdog(self):
+        """Returns True while the game looks frozen (worker should not teleport).
+        SX logs an [Encounter] check about every 30 s; silence = frozen game."""
+        if not config.get("freeze_watchdog_enabled", True) or not self.browser:
+            return False
+        if self._bg_scanner_task is None or self._bg_scanner_task.done():
+            # heartbeat comes from the background scanner — make sure it's alive
+            self._bg_scanner_task = asyncio.create_task(self._background_log_scanner())
+            self._last_game_heartbeat = time.time()
+            return False
+        now = time.time()
+        silence = now - self._last_game_heartbeat
+        limit = config.get("freeze_silence_seconds", 180)
+        if silence < limit:
+            if self._game_frozen:
+                print("[Watchdog] Game encounter activity is back — resuming")
+                stats.add_event("system", "Game recovered after freeze")
+            self._game_frozen = False
+            self._watchdog_restarts = 0
+            return False
+        if not self._game_frozen:
+            self._game_frozen = True
+            print(f"[Watchdog] No game encounter activity for {int(silence)}s — game looks frozen")
+            stats.add_event("system", f"Game frozen ({int(silence)}s without encounter activity)")
+        wait = config.get("freeze_restart_wait_seconds", 240)
+        since_restart = now - self._watchdog_last_restart
+        if since_restart < wait:
+            self.current_activity = f"Game frozen — waiting for restart to take effect ({int(wait - since_restart)}s)"
+            self.loop_step = 0
+            return True
+        max_tries = config.get("freeze_max_restarts", 3)
+        if self._watchdog_restarts >= max_tries:
+            msg = (f"Lumix: the game has been frozen for {int(silence // 60)} min and {max_tries} restarts "
+                   f"didn't fix it. The bot is paused — please check the iPad.")
+            print(f"[Watchdog] {msg}")
+            stats.add_event("system", "Paused: game still frozen after restarts")
+            self.paused = True
+            self._game_frozen = False
+            self._watchdog_restarts = 0
+            self._last_game_heartbeat = now  # grace period after you resume
+            await self._notify_user(msg)
+            return True
+        self._watchdog_restarts += 1
+        self._watchdog_last_restart = now
+        self.current_activity = f"Game frozen — restarting SX game (try {self._watchdog_restarts}/{max_tries})"
+        self.loop_step = 0
+        print(f"[Watchdog] Restarting SX game (try {self._watchdog_restarts}/{max_tries})")
+        stats.add_event("system", f"Watchdog restarting SX game (try {self._watchdog_restarts}/{max_tries})")
+        try:
+            ok = await self.browser.restart_game()
+            print(f"[Watchdog] Restart {'OK' if ok else 'reported failure'}")
+        except Exception as e:
+            print(f"[Watchdog] Restart error: {e}")
+        self._last_sx_restart_time = asyncio.get_event_loop().time()
+        self._bg_baseline_lines = set()
+        return True
 
     def _setup_events(self):
         client = self.client
@@ -499,31 +590,67 @@ class PokeBot:
             ep -= 86400
         return ep
 
-    def _find_catch_outcome(self, lines, dex, species, since):
-        """Scan SX log lines for this Pokémon's [CatchPokemon] outcome after `since`.
+    @classmethod
+    def _parse_sx_records(cls, text, now=None):
+        """Parse SX log page text into ordered (epoch, module, message) records.
+        Live page layout puts time, module and message on separate lines:
+            [18:43:29]
+            [NormalEncounter]
+            Normal-Encounter Pokemon Venipede (#543) — ...
+        The 'Copy' export puts them on one line: [18:43:29] [NormalEncounter] Normal-...
+        Both are handled."""
+        recs = []
+        cur_t, cur_mod = None, None
+        now = now or time.time()
+        for raw in (text or "").splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            m = re.match(r"^\[(\d{1,2}):(\d{2}):(\d{2})\]\s*(.*)$", line)
+            if m:
+                cur_t = cls._log_line_epoch(line, now=now)
+                cur_mod = None
+                rest = m.group(4).strip()
+                if rest:
+                    m2 = re.match(r"^\[([A-Za-z]+)\]\s*(.*)$", rest)
+                    if m2:
+                        cur_mod = m2.group(1)
+                        if m2.group(2):
+                            recs.append((cur_t, cur_mod, m2.group(2).strip()))
+                continue
+            if cur_t is None:
+                continue
+            if cur_mod is None:
+                m2 = re.match(r"^\[([A-Za-z]+)\]\s*(.*)$", line)
+                if m2:
+                    cur_mod = m2.group(1)
+                    if m2.group(2):
+                        recs.append((cur_t, cur_mod, m2.group(2).strip()))
+                continue
+            recs.append((cur_t, cur_mod, line))
+        return recs
+
+    def _find_catch_outcome(self, records, dex, species, since):
+        """From parsed SX records, find this Pokémon's [CatchPokemon] verdict after `since`.
         Returns (outcome, epoch, encounter_id) with outcome 'caught' / 'fled' / None."""
         sp = base_species(species).replace("-", " ")
         tag = f"(#{dex})" if dex else None
-        enc_id = None
-        outcome = None
-        when = None
-        for line in sorted(lines, key=lambda l: self._log_line_epoch(l) or 0):
-            ll = line.lower()
-            t = self._log_line_epoch(line)
+        enc_id = outcome = when = None
+        for t, mod, msg in records:
             if t is None or t < since - 2:
                 continue
-            hit = (tag and tag in ll) or (sp and sp in ll.replace("-", " ").replace(".", ""))
+            ml = msg.lower()
+            hit = (tag and tag in ml) or (sp and sp in ml.replace("-", " ").replace(".", ""))
             if not hit:
                 continue
-            if "[normalencounter]" in ll and "encounterid:" in ll:
-                m = re.search(r"EncounterId:\s*(\d+)", line)
+            if mod == "NormalEncounter" and "encounterid:" in ml:
+                m = re.search(r"EncounterId:\s*(\d+)", msg)
                 if m:
                     enc_id = m.group(1)
-            if "[catchpokemon]" in ll:
-                after = ll.split("[catchpokemon]", 1)[1].strip()
-                if after.startswith("caught"):
+            elif mod == "CatchPokemon":
+                if ml.startswith("caught"):
                     outcome, when = "caught", t
-                elif " fled" in after:
+                elif " fled" in ml:
                     outcome, when = "fled", t
                 # "escaped!" = ball broke out, SX keeps throwing — not final
         return outcome, when, enc_id
@@ -538,8 +665,8 @@ class PokeBot:
                 text = await self.browser.read_logs()
             except Exception:
                 text = ""
-            lines = [l for l in (text or "").splitlines() if l not in baseline_lines]
-            outcome, when, enc_id = self._find_catch_outcome(lines, dex, task.pokemon, since)
+            records = self._parse_sx_records(text)
+            outcome, when, enc_id = self._find_catch_outcome(records, dex, task.pokemon, since)
             if outcome or time.time() > deadline:
                 return outcome, when, enc_id
             self.current_activity = f"Confirming catch for {display_name(task.pokemon)}…"
@@ -1377,6 +1504,29 @@ class PokeBot:
                 if not text:
                     continue
 
+                # Structured view of the log: timestamps per message, game heartbeat, flees
+                try:
+                    bg_records = self._parse_sx_records(text)
+                except Exception as e:
+                    bg_records = []
+                    print(f"[BgScanner] Log parse error: {e}")
+                bg_msg_time = {}
+                for _t, _mod, _msg in bg_records:
+                    bg_msg_time[_msg] = _t  # last occurrence wins
+                    if _mod in ("Encounter", "NormalEncounter") and _t:
+                        self._last_game_heartbeat = max(self._last_game_heartbeat, _t)
+                    if _mod == "CatchPokemon" and " fled" in _msg.lower() and _t:
+                        key = (int(_t), _msg)
+                        if key not in self._seen_flees:
+                            self._seen_flees.add(key)
+                            if len(self._seen_flees) > 500:
+                                self._seen_flees = set(list(self._seen_flees)[-200:])
+                            if time.time() - _t < 900:  # ignore old history on startup
+                                fc = self._coords_at(_t) or self.current_coords
+                                if fc:
+                                    stats.record_flee_anchor(fc, at_time=_t, reason="fled")
+                                    print(f"[BgScanner] Flee detected: {_msg[:60]} at {fc} — cooldown reset")
+
                 current_lines = set(text.splitlines())
                 new_lines = current_lines - self._bg_baseline_lines
                 self._bg_baseline_lines = current_lines
@@ -1403,16 +1553,6 @@ class PokeBot:
                             r'Caught.*?Pokemon\s+(.+?)\s+\(#(\d+)\)',
                             line, re.IGNORECASE
                         )
-                        flee_match = None if catch_match else re.search(
-                            r'\[CatchPokemon\].*?Pokemon\s+(.+?)\s+\(#(\d+)\)\s+fled',
-                            line, re.IGNORECASE
-                        )
-                        if flee_match:
-                            ft = self._log_line_epoch(line) or time.time()
-                            fc = self._coords_at(ft) or self.current_coords
-                            if fc:
-                                stats.record_flee_anchor(fc, at_time=ft, reason="fled")
-                                print(f"[BgScanner] Flee detected: {flee_match.group(1)} at {fc} — cooldown reset")
                         if catch_match:
                             dex_num = int(catch_match.group(2))
                             caught_name = get_name_by_id(dex_num) or catch_match.group(1).strip()
@@ -1447,7 +1587,7 @@ class PokeBot:
                             # Attribute the catch to where the player WAS at the logged time
                             # (this scanner can run 15 s+ after the catch, by which point the
                             # worker may already have teleported somewhere else).
-                            line_t = self._log_line_epoch(line)
+                            line_t = bg_msg_time.get(line.strip()) or self._log_line_epoch(line)
                             coords = self._coords_at(line_t) if line_t else None
                             if not coords:
                                 coords = self.current_coords or self._last_encounter_coords
@@ -1546,7 +1686,7 @@ class PokeBot:
                                 notify_id = config.get("notify_user_id")
                                 if notify_id:
                                     try:
-                                        user = await self.client.fetch_user(int(notify_id))
+                                        user = await self._get_notify_target(notify_id)
                                         if user:
                                             await self._dm(user, f"SHUNDO FOUND! {display_name(pokemon_name)} — {cp}cp, {iv_str}")
                                             print(f"[BgScanner] Notified user about shundo {pokemon_name}")
@@ -1815,6 +1955,12 @@ class PokeBot:
                 self.loop_step = 0
                 await asyncio.sleep(1)
                 continue
+            try:
+                if await self._freeze_watchdog():
+                    await asyncio.sleep(5)
+                    continue
+            except Exception as e:
+                print(f"[Watchdog] Error: {e}")
             task = None
             try:
                 # Cleanup expired targets
@@ -1856,8 +2002,15 @@ class PokeBot:
                                                  f"({dist:.0f}km) • {n_plan} planned")
                         self.loop_step = 6
                     elif self.shundos.has_active():
-                        self.current_activity = "Getting shundo coordinates from PokeX…"
-                        self.loop_step = 2
+                        n_pend = len(self.shundos.pending())
+                        n_coords = sum(1 for _e in self.shundos.entries.values() if _e["status"] == "pending_coords")
+                        if n_coords:
+                            self.current_activity = "Getting shundo coordinates from PokeX…"
+                            self.loop_step = 2
+                        else:
+                            self.current_activity = (f"{n_pend} shundo{'s' if n_pend != 1 else ''} pending — "
+                                                     f"none reachable before despawn")
+                            self.loop_step = 6
                     elif not config.get("channel_watch_enabled", True):
                         self.current_activity = "Waiting for PokeX shundo alerts…"
                         self.loop_step = 1
@@ -2180,7 +2333,7 @@ class PokeBot:
                         notify_id = config.get("notify_user_id")
                         if notify_id:
                             try:
-                                user = await self.client.fetch_user(int(notify_id))
+                                user = await self._get_notify_target(notify_id)
                                 if user:
                                     await self._dm(
                                         user,
@@ -2262,7 +2415,7 @@ class PokeBot:
                         notify_id = config.get("notify_user_id")
                         if notify_id:
                             try:
-                                user = await self.client.fetch_user(int(notify_id))
+                                user = await self._get_notify_target(notify_id)
                                 if user:
                                     await self._dm(
                                         user,
@@ -2363,7 +2516,7 @@ class PokeBot:
                         notify_id = config.get("notify_user_id")
                         if notify_id:
                             try:
-                                user = await self.client.fetch_user(int(notify_id))
+                                user = await self._get_notify_target(notify_id)
                                 if user:
                                     await self._dm(
                                         user,
