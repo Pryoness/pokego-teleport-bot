@@ -443,6 +443,7 @@ async def api_start():
         app.state.bot.running = True
         app.state.bot.paused = False  # Unpause if was paused
         stats.record_start()  # Resumes timer without resetting
+        stats.add_event("system", "Hunting resumed via dashboard")
         # Only create worker task if it doesn't exist or is done
         if app.state.bot.worker_task is None or app.state.bot.worker_task.done():
             app.state.bot.worker_task = asyncio.create_task(app.state.bot._worker_loop())
@@ -456,6 +457,7 @@ async def api_stop():
         app.state.bot.paused = True  # Pause the worker loop
         app.state.bot.running = True   # Keep loop alive so it can resume
         stats.record_stop()  # Freeze the timer
+        stats.add_event("system", "Hunting paused via dashboard")
     app.state.running = True  # Keep flag so loop stays alive
     return {"status": "ok", "message": "Paused"}
 

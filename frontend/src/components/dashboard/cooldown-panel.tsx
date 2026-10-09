@@ -9,7 +9,6 @@ import { useState } from "react";
 export function CooldownPanel({ className, readOnly = false }: { className?: string; readOnly?: boolean }) {
   const lastCatch = useHuntStore((s) => s.lastCatch);
   const backendInfo = useHuntStore((s) => s.catchCooldownInfo);
-  const lastPollAt = useHuntStore((s) => s.hunter.lastPollAt);
   const setLastCatch = useHuntStore((s) => s.setLastCatch);
   const clearCooldown = useHuntStore((s) => s.clearCooldown);
   const now = useNow(1000);
@@ -26,7 +25,8 @@ export function CooldownPanel({ className, readOnly = false }: { className?: str
 
   // Live countdown: subtract time elapsed since last poll from the backend's remaining_seconds
   const snapshotRem = backendInfo?.remaining_seconds ?? 0;
-  const secsSincePoll = lastPollAt > 0 ? Math.floor((now - lastPollAt) / 1000) : 0;
+  const snapshotAt = backendInfo?.received_at_ms ?? now;
+  const secsSincePoll = Math.max(0, Math.floor((now - snapshotAt) / 1000));
   const liveRem = active ? Math.max(0, snapshotRem - secsSincePoll) : 0;
   const anyTotal = backendInfo?.anywhere_total_seconds ?? 7200;
   const anyRem = Math.max(0, (backendInfo?.anywhere_remaining_seconds ?? 0) - secsSincePoll);
@@ -60,7 +60,7 @@ export function CooldownPanel({ className, readOnly = false }: { className?: str
           </div>
           {anchorAge != null ? (
             <p className="mt-1 font-mono text-xs text-muted">
-              {anchorWhy && anchorWhy !== "catch" ? "Reset by flee" : "Last catch"} {formatDuration(anchorAge)} ago
+              {anchorWhy?.startsWith("fled") ? "Reset by flee" : "Last catch"} {formatDuration(anchorAge)} ago
             </p>
           ) : null}
           {active && liveRem > 0 && distKm > 0 ? (

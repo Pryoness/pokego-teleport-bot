@@ -210,6 +210,7 @@ export interface BotStatus {
 
 export const api = {
   async getStatus(): Promise<BotStatus> {
+    const requestedAt = Date.now();
     const raw = await get<any>("/api/status");
     return {
       running: raw.running ?? false,
@@ -220,7 +221,11 @@ export const api = {
       queueSize: raw.queue_size ?? 0,
       inCooldown: raw.in_cooldown ?? false,
       cooldownRemaining: raw.cooldown_remaining ?? 0,
-      catchCooldownInfo: raw.catch_cooldown_info,
+      catchCooldownInfo: {
+        ...raw.catch_cooldown_info,
+        received_at_ms: Date.now(),
+        requested_at_ms: requestedAt,
+      },
       deviceTemp: raw.device_temp ?? null,
       deviceTempTime: raw.device_temp_time ?? null,
       deviceName: raw.device_name ?? null,

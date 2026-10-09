@@ -512,8 +512,6 @@ class StatsTracker:
         with self._lock:
             last_coords = self._data.get("last_catch_coords")
             last_catch_time = self._data.get("last_catch_time", 0)
-            if not last_coords or last_catch_time == 0:
-                return 0  # No previous catch — no cooldown needed
             if not target_coords:
                 return 0
             # Parse target_coords — accept tuple or string
@@ -529,7 +527,9 @@ class StatsTracker:
                     return 0
             except (ValueError, IndexError, TypeError):
                 return 0
-            anchors = [((last_coords["lat"], last_coords["lng"]), float(last_catch_time))]
+            anchors = []
+            if last_coords and last_catch_time:
+                anchors.append(((last_coords["lat"], last_coords["lng"]), float(last_catch_time)))
             anchors += [((a["lat"], a["lng"]), float(a["t"])) for a in self._data.get("cooldown_anchors", [])]
         now = time.time()
         remaining = 0
@@ -540,20 +540,47 @@ class StatsTracker:
                     continue
                 required = get_cooldown_for_distance(haversine_km(alat, alng, target_lat, target_lng))
                 remaining = max(remaining, required - elapsed)
-            return max(0, int(remaining))
+            return max(0, math.ceil(remaining))
         except Exception as e:
             print(f"[Stats] Error calculating target cooldown: {e}")
             return 0
 
     def get_catch_cooldown_info(self, target_coords=None):
         """Dashboard cooldown info, including flee-reset anchors."""
-        info = self._cooldown_info_base(target_coords)
-        if target_coords:
-            rem = self.get_catch_cooldown_for_target(target_coords)
-            if rem > info.get("remaining_seconds", 0):
-                info.update(active=True, remaining_seconds=int(rem), reason="Flee reset cooldown")
-        # "Catch anywhere" countdown: time until every cooldown origin is 2 h old
         now = time.time()
+        origins = []
+        with self._lock:
+            lc = self._data.get("last_catch_coords")
+            lt = self._data.get("last_catch_time") or 0
+            if lc and lt:
+                origins.append(dict(lat=lc["lat"], lng=lc["lng"], t=float(lt), why="catch"))
+            origins.extend(dict(a) for a in self._data.get("cooldown_anchors", []))
+        active_origins = [a for a in origins if now - a["t"] < MAX_COOLDOWN]
+        info = {"active": False, "remaining_seconds": 0, "reason": "Ready to catch",
+                "last_catch_coords": lc}
+        if target_coords and active_origins:
+            try:
+                parts = target_coords.replace(",", " ").split() if isinstance(target_coords, str) else target_coords
+                lat, lng = float(parts[0]), float(parts[1])
+                candidates = []
+                for a in active_origins:
+                    distance = haversine_km(a["lat"], a["lng"], lat, lng)
+                    required = get_cooldown_for_distance(distance)
+                    remaining = max(0, required - (now - a["t"]))
+                    candidates.append((remaining, distance, required, a))
+                remaining, distance, required, controlling = max(candidates, key=lambda x: x[0])
+                info.update(active=remaining > 0, remaining_seconds=max(0, math.ceil(remaining)),
+                            distance_km=round(distance, 1), required_minutes=required / 60,
+                            elapsed_minutes=(now - controlling["t"]) / 60,
+                            controlling_anchor=controlling,
+                            reason="Flee reset cooldown" if controlling["why"].startswith("fled") else "Catch cooldown")
+                if remaining <= 0:
+                    info["reason"] = "Ready to catch here"
+            except (ValueError, TypeError, IndexError):
+                info["reason"] = "Invalid target coordinates"
+        elif lt:
+            info["elapsed_minutes"] = (now - lt) / 60
+        # "Catch anywhere" countdown: time until every cooldown origin is 2 h old
         latest, why = 0.0, None
         with self._lock:
             lt = self._data.get("last_catch_time") or 0
@@ -562,11 +589,15 @@ class StatsTracker:
             for a in self._data.get("cooldown_anchors", []):
                 if a.get("t", 0) > latest and not str(a.get("why", "")).startswith("unconfirmed"):
                     latest, why = float(a["t"]), a.get("why", "fled")
-        anywhere = max(0, int(latest + MAX_COOLDOWN - now)) if latest else 0
+        anywhere = max(0, math.ceil(latest + MAX_COOLDOWN - now)) if latest else 0
         info["anywhere_remaining_seconds"] = anywhere
         info["anywhere_total_seconds"] = MAX_COOLDOWN
         info["anchor_reason"] = why
         info["anchor_age_seconds"] = int(now - latest) if latest else None
+        pct, pad, mode = _safety()
+        info["cooldown_policy"] = {"origins": active_origins, "chart": COOLDOWN_CHART,
+                                   "percent": pct, "padding_seconds": pad, "mode": mode}
+        info["server_time"] = now
         return info
 
     def _cooldown_info_base(self, target_coords=None):
@@ -638,6 +669,7 @@ class StatsTracker:
         with self._lock:
             self._data["last_catch_coords"] = None
             self._data["last_catch_time"] = 0
+            self._add_event("cooldown", "Last catch explicitly cleared; flee anchors retained")
             self._add_event("catch", "Manual catch cleared")
         self.save()
 
@@ -764,6 +796,7 @@ class StatsTracker:
             saved_last_catch_coords = self._data.get("last_catch_coords")
             saved_last_catch_time = self._data.get("last_catch_time", 0)
             saved_cooldown_until = self._data.get("cooldown_until", 0)
+            saved_anchors = list(self._data.get("cooldown_anchors", []))
 
             # Full reset of stats
             self._data = self._default()
@@ -774,6 +807,7 @@ class StatsTracker:
             self._data["last_catch_coords"] = saved_last_catch_coords
             self._data["last_catch_time"] = saved_last_catch_time
             self._data["cooldown_until"] = saved_cooldown_until
+            self._data["cooldown_anchors"] = saved_anchors
 
             # Restart elapsed timer at 0 and mark as running
             self._data["start_time"] = time.time()

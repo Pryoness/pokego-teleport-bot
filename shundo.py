@@ -24,6 +24,9 @@ STATE_PATH = os.path.join(SCRIPT_DIR, "shundo_state.json")
 LOG_PATH = os.path.join(SCRIPT_DIR, "shundo_log.jsonl")
 
 _RE_NAME = re.compile(r"\*\*([^*]+?)\*\*")
+_RE_LINKED_NAME = re.compile(
+    r"\[([^\]\n]+)\]\((https://(?:(?:canary|ptb)\.)?discord(?:app)?\.com/channels/\d+/\d+/\d+)\)"
+)
 _RE_LVL = re.compile(r"<:LVL:\d+>\s*\*\*(\d+)\*\*")
 _RE_CP = re.compile(r"<:CP:\d+>\s*\*\*(\d+)\*\*")
 _RE_CITY = re.compile(r"__(.+?)__")
@@ -55,14 +58,15 @@ def parse_alert(content):
     if not content or "<t:" not in content:
         return None
     dsp = _RE_DSP.search(content)
+    linked_name = _RE_LINKED_NAME.search(content)
     name = _RE_NAME.search(content)
-    if not dsp or not name:
+    if not dsp or not (linked_name or name):
         return None
     lvl = _RE_LVL.search(content)
     cp = _RE_CP.search(content)
     city = _RE_CITY.search(content)
     gender = "♀" if "♀" in content else ("♂" if "♂" in content else "")
-    raw_name = name.group(1).strip()
+    raw_name = (linked_name.group(1) if linked_name else name.group(1)).strip("* _")
     return {
         "name": raw_name,
         "species": normalize_species(raw_name),
@@ -71,6 +75,7 @@ def parse_alert(content):
         "city": city.group(1).strip() if city else "",
         "gender": gender,
         "expires_at": float(dsp.group(1)),
+        "source_message_url": linked_name.group(2) if linked_name else None,
     }
 
 

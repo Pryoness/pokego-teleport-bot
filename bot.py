@@ -212,6 +212,13 @@ class PokeBot:
             self._last_message_time = time.time()
             await self._on_message(message)
 
+        @client.event
+        async def on_message_edit(before, after):
+            # Copy replies can arrive as a deferred response that is edited in afterwards
+            fut = self._pokex_coord_future
+            if fut is not None and not fut.done() and self._is_trusted_pokex_author(after):
+                await self._on_pokex_message(after)
+
     def _print_banner(self):
         print()
         print("=" * 60)
@@ -245,10 +252,10 @@ class PokeBot:
 
         # PokeX guaranteed-shundo DMs (alerts + ephemeral Copy replies) are handled
         # separately and never fall through to the channel/Reveal Coords logic.
-        if self._is_pokex_message(message):
+        if self._is_trusted_pokex_author(message):
             waiting = self._pokex_coord_future is not None and not self._pokex_coord_future.done()
             ephemeral = bool(getattr(getattr(message, "flags", None), "ephemeral", False))
-            if self._in_pokex_dm(message) or (waiting and ephemeral):
+            if (self._in_pokex_dm(message) and self._is_pokex_message(message)) or (waiting and ephemeral):
                 await self._on_pokex_message(message)
                 return
 
@@ -334,6 +341,13 @@ class PokeBot:
         bot_id = str(config.get("pokex_bot_id", ""))
         return bool(bot_id) and str(message.author.id) == bot_id
 
+    def _is_trusted_pokex_author(self, message):
+        """PokeX DM bot, or one of the bots that post the linked Copy message (e.g. 'Coords')."""
+        if self._is_pokex_message(message):
+            return True
+        ids = {str(i) for i in (config.get("pokex_source_bot_ids") or [])}
+        return str(message.author.id) in ids
+
     def _in_pokex_dm(self, message):
         dm_id = str(config.get("shundo_dm_channel_id", ""))
         return bool(dm_id) and str(message.channel.id) == dm_id
@@ -343,7 +357,10 @@ class PokeBot:
         # 1) Ephemeral reply to a Copy click -> coordinates
         if self._pokex_coord_future and not self._pokex_coord_future.done():
             coords = parse_coords(content)
-            if coords and "<t:" not in content:
+            reply_channel = getattr(self, "_pokex_reply_channel_id", None)
+            if coords and "<t:" not in content and (
+                reply_channel is None or int(message.channel.id) == int(reply_channel)
+            ):
                 self._pokex_coord_future.set_result(coords)
                 return
         # 2) A new alert in the PokeX DM
@@ -372,7 +389,10 @@ class PokeBot:
         print(f"[Shundo] Alert: {alert['name']} L{alert['level']} CP{alert['cp']} {alert['city']} — DSP {left // 60}m {left % 60}s")
         stats.add_event("shundo", f"PokeX shundo alert: {alert['name']} ({alert['city']}, DSP {left // 60}m)")
         coords = None
-        for attempt in range(2):
+        for attempt in range(3):
+            if time.time() >= alert["expires_at"]:
+                self.shundos.set_status(message.id, "expired")
+                return
             coords = await self._click_pokex_copy(message)
             if coords:
                 break
@@ -384,22 +404,69 @@ class PokeBot:
         e = self.shundos.set_coords(message.id, coords)
         print(f"[Shundo] {alert['name']} coords {coords} ({e['status']})")
 
+    @staticmethod
+    def _find_copy_button(components):
+        """Walk legacy rows and nested Components V2 without scanning other messages."""
+        for comp in components or []:
+            label = getattr(comp, "label", "") or ""
+            if "copy" in label.lower() and callable(getattr(comp, "click", None)):
+                return comp
+            children = list(getattr(comp, "children", []) or [])
+            children += list(getattr(comp, "components", []) or [])
+            accessory = getattr(comp, "accessory", None)
+            if accessory is not None:
+                children.append(accessory)
+            button = PokeBot._find_copy_button(children)
+            if button is not None:
+                return button
+        return None
+
+    async def _resolve_pokex_copy_message(self, message):
+        """Resolve only the message explicitly linked by a trusted PokeX DM.
+        This does not subscribe to the linked channel or expand watched channels."""
+        fresh = await message.channel.fetch_message(message.id)
+        if not self._is_pokex_message(fresh) or not self._in_pokex_dm(fresh):
+            raise ValueError("Not a trusted PokeX DM")
+        if self._find_copy_button(fresh.components):
+            return fresh
+        alert = parse_alert(fresh.content or "")
+        url = alert.get("source_message_url") if alert else None
+        if not url:
+            raise ValueError("No Copy button or linked server message in PokeX DM")
+        match = re.fullmatch(
+            r"https://(?:(?:canary|ptb)\.)?discord(?:app)?\.com/channels/(\d+)/(\d+)/(\d+)",
+            url,
+        )
+        if not match:
+            raise ValueError("Invalid Discord message link")
+        guild_id, channel_id, message_id = map(int, match.groups())
+        channel = self.client.get_channel(channel_id) or await self.client.fetch_channel(channel_id)
+        guild = getattr(channel, "guild", None)
+        if guild is None or int(guild.id) != guild_id:
+            raise ValueError("Linked channel does not match the linked server")
+        source = await channel.fetch_message(message_id)
+        if not self._is_trusted_pokex_author(source):
+            raise ValueError(f"Linked message author {source.author.id} is not a trusted PokeX bot")
+        print(f"[Shundo] Resolved DM {message.id} to server message {source.id} in {channel_id}")
+        return source
+
     async def _click_pokex_copy(self, message):
-        """Click the PokeX 'Copy' button and wait for the ephemeral coordinates reply."""
+        """Fresh DM -> optional linked message -> Copy -> scoped ephemeral reply."""
         async with self._copy_lock:
-            button = None
-            for row in message.components or []:
-                for comp in getattr(row, "children", []):
-                    label = getattr(comp, "label", "") or ""
-                    if "copy" in label.lower():
-                        button = comp
-                        break
-                if button:
-                    break
-            if not button:
-                print("[Shundo] No Copy button on alert message")
+            try:
+                source = await self._resolve_pokex_copy_message(message)
+            except Exception as e:
+                print(f"[Shundo] Copy source lookup failed: {type(e).__name__}: {e}")
+                return None
+            button = self._find_copy_button(source.components)
+            if button is None:
+                print("[Shundo] Linked message has no usable Copy button yet")
+                return None
+            alert = parse_alert(message.content or "")
+            if alert and alert["expires_at"] <= time.time():
                 return None
             loop = asyncio.get_event_loop()
+            self._pokex_reply_channel_id = source.channel.id
             self._pokex_coord_future = loop.create_future()
             try:
                 try:
@@ -414,6 +481,7 @@ class PokeBot:
                     return None
             finally:
                 self._pokex_coord_future = None
+                self._pokex_reply_channel_id = None
                 await asyncio.sleep(2)  # be gentle with Discord interactions
 
     async def _shundo_startup_backfill(self):

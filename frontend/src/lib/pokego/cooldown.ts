@@ -87,7 +87,46 @@ export function getCooldownInfo(
   target: { lat: number; lng: number } | string | null,
   now = Date.now(),
   cap = MAX_COOLDOWN,
+  snapshot?: any,
 ): CooldownInfo {
+  // Use the backend's origins, chart and policy, including flee-only anchors.
+  const policy = snapshot?.cooldown_policy;
+  if (policy) {
+    const parsed = typeof target === "string" ? parseCoords(target) : target;
+    if (!parsed) return { active: false, reason: "No target coordinates" };
+    const serverNow = snapshot.server_time +
+      Math.max(0, now - (snapshot.received_at_ms ?? now)) / 1000;
+    let winner: CooldownInfo = { active: false, remainingSeconds: 0, reason: "Ready" };
+    let longest = -1;
+    for (const origin of policy.origins ?? []) {
+      const elapsed = serverNow - origin.t;
+      if (elapsed >= cap) continue;
+      const distance = haversineKm(origin.lat, origin.lng, parsed.lat, parsed.lng);
+      const chart = policy.chart as Array<[number, number]>;
+      let base = chart[chart.length - 1][1];
+      if (distance <= chart[0][0]) base = chart[0][1];
+      else for (let i = 0; i < chart.length - 1; i++) {
+        const [d0, c0] = chart[i], [d1, c1] = chart[i + 1];
+        if (d0 <= distance && distance < d1) {
+          base = policy.mode === "floor" ? c0 : policy.mode === "round_up" ? c1 :
+            c0 + (distance - d0) / (d1 - d0) * (c1 - c0);
+          break;
+        }
+      }
+      const required = Math.min(cap, base * (1 + policy.percent / 100) + policy.padding_seconds);
+      const remaining = Math.max(0, Math.ceil(required - elapsed));
+      if (remaining > longest) {
+        longest = remaining;
+        winner = {
+          active: remaining > 0, remainingSeconds: remaining,
+          requiredSeconds: required, elapsedSeconds: Math.floor(elapsed),
+          distanceKm: Math.round(distance * 10) / 10,
+          reason: origin.why?.startsWith("fled") ? "Flee reset" : "Catch cooldown",
+        };
+      }
+    }
+    return winner;
+  }
   if (!lastCatch) return { active: false, reason: "No previous catch" };
   const elapsedMs = now - lastCatch.time;
   const elapsedSeconds = Math.floor(elapsedMs / 1000);

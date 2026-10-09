@@ -49,6 +49,8 @@ DEFAULTS = {
     "shundo_dm_enabled": True,
     "shundo_dm_channel_id": "",  # DM channel with the PokeX bot
     "pokex_bot_id": "1015817657146159115",
+    # Bots that post the linked server message with the Copy button (and send the coords reply)
+    "pokex_source_bot_ids": ["1015820911179481138"],
     "shundo_catch_overhead_seconds": 60,  # teleport+walk+encounter time used by the planner
     "shundo_monitor_timeout_seconds": 45,  # how long to watch logs after a shundo teleport
     "shundo_plan_budget_seconds": 5,  # safety time limit for the exact planner

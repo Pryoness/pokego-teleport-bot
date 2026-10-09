@@ -169,6 +169,8 @@ export const useHuntStore = create<HuntStore>((set, get) => ({
         api.getMap(),
       ]);
 
+      if ((status.catchCooldownInfo?.requested_at_ms ?? 0) <
+          (get().catchCooldownInfo?.requested_at_ms ?? 0)) return;
       _localTargets = targets;
       _localSettings = settings;
 
@@ -525,6 +527,8 @@ export const useHuntStore = create<HuntStore>((set, get) => ({
         api.getMap(),
       ]);
 
+      if ((status.catchCooldownInfo?.requested_at_ms ?? 0) <
+          (get().catchCooldownInfo?.requested_at_ms ?? 0)) return;
       // Don't overwrite targets during a pending toggle — prevents race condition
       // where the poll fetches stale data before the toggle API call completes
       if (!_pendingTargetToggle) {
@@ -602,7 +606,7 @@ export const useHuntStore = create<HuntStore>((set, get) => ({
 
   cooldownFor: (coords, now = Date.now()) => {
     const s = get();
-    return getCooldownInfo(s.lastCatch, coords, now, 7200);
+    return getCooldownInfo(s.lastCatch, coords, now, 7200, s.catchCooldownInfo);
   },
 
   rankedQueue: (now = Date.now()) => {
@@ -616,6 +620,7 @@ export const useHuntStore = create<HuntStore>((set, get) => ({
           t.lat != null && t.lng != null ? { lat: t.lat, lng: t.lng } : t.coords,
           now,
           7200,
+          s.catchCooldownInfo,
         );
         const dist =
           s.lastCatch && t.lat != null && t.lng != null
