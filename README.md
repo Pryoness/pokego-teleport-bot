@@ -262,3 +262,9 @@ Using a personal Discord account token (self-bot) violates Discord's Terms of Se
 - Log: `shundo_log.jsonl`. Discord: `@bot shundos` shows the plan.
 
 New config keys: `channel_watch_enabled`, `shundo_dm_enabled`, `shundo_dm_channel_id`, `pokex_bot_id`, `shundo_catch_overhead_seconds` (60), `shundo_monitor_timeout_seconds` (45), `shundo_plan_budget_seconds` (5), `shundo_pause_queue` (true).
+
+### Skip / ignore list
+- Each hunt-list row has a **Skip** pill next to High/Low and Solo. The Add toggle cycles **Low → High → Skip**.
+- Rules: empty list = hunt every Pokémon; otherwise hunt the non-skipped targets; if every target is skipped, hunt every Pokémon **except** the skipped ones.
+- Skipped Pokémon are never auto-removed after catches; Skip and Solo are mutually exclusive.
+- Config key `skip_pokemon`; API `POST /api/targets/{name}/skip`; Discord `@bot skip <a, b>` / `@bot unskip <a>`.

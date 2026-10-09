@@ -22,6 +22,8 @@ export type Priority = 0 | 1; // 0 = high
 export interface TargetPokemon {
   name: string;
   priority: Priority;
+  targetOnly: boolean;
+  skip: boolean;
   addedAt: number;
 }
 
@@ -81,6 +83,7 @@ export interface Settings {
   queueLimitPerPokemon: number;
   clusterSkipThreshold: number;
   minDspSeconds: number;
+  deviceTempIntervalSeconds: number;
   demoFeedEnabled: boolean;
   backgroundImageUrl: string;
   backgroundImageUrlMobile: string;
@@ -105,6 +108,10 @@ export interface StatsData {
   shundoTimestamps: number[];
   hundoIntervals: number[];
   hundosSinceCatch: number;
+  hundosPerHour: number;
+  shiniesPerHour: number;
+  shundosPerHour: number;
+  teleportsPerHour: number;
   startTime: number;
   stopTime: number;
   lastCaught: {
@@ -127,6 +134,9 @@ export interface HunterState {
   stepStartedAt: number;
   skipRequested: boolean;
   awaitingOutcome: boolean;
+  deviceTemp?: number | null;
+  deviceTempTime?: number | null;
+  deviceName?: string | null;
 }
 
 export interface CooldownInfo {
@@ -149,6 +159,7 @@ export const DEFAULT_SETTINGS: Settings = {
   queueLimitPerPokemon: 5,
   clusterSkipThreshold: 5,
   minDspSeconds: 120,
+  deviceTempIntervalSeconds: 30,
   demoFeedEnabled: true,
   backgroundImageUrl: "",
   backgroundImageUrlMobile: "",

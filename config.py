@@ -34,6 +34,7 @@ DEFAULTS = {
     "notify_user_id": "",
     "high_priority_pokemon": [],
     "target_only_pokemon": [],  # Pokémon to encounter but not catch
+    "skip_pokemon": [],  # Ignore list: never hunted. If every target is skipped, hunt everything else.
     "skip_non_shiny": True,
     "queue_limit_per_pokemon": 5,
     "remove_evolution_line": False,
@@ -124,6 +125,9 @@ class Config:
                 self._data["target_pokemon"].remove(name)
             if name in self._data.get("high_priority_pokemon", []):
                 self._data["high_priority_pokemon"].remove(name)
+            for key in ("skip_pokemon", "target_only_pokemon"):
+                if name in self._data.get(key, []):
+                    self._data[key].remove(name)
         self.save()
 
     def get_targets(self):
@@ -161,6 +165,9 @@ class Config:
                 only_list.remove(name)
             else:
                 only_list.append(name)
+                skip = self._data.get("skip_pokemon", [])
+                if name in skip:
+                    skip.remove(name)
             self._data["target_only_pokemon"] = only_list
         self.save()
 
@@ -168,6 +175,53 @@ class Config:
         name = pokemon_name.lower().strip()
         with self._lock:
             return name in self._data.get("target_only_pokemon", [])
+
+    # ── Skip / ignore list ──
+    def toggle_skip(self, pokemon_name):
+        """Toggle Skip for a Pokémon. Skip and Solo are mutually exclusive.
+        Skipping a Pokémon that isn't in the list adds it to the list as skipped."""
+        name = pokemon_name.lower().strip()
+        with self._lock:
+            skip = self._data.get("skip_pokemon", [])
+            if name in skip:
+                skip.remove(name)
+            else:
+                skip.append(name)
+                if name not in self._data.get("target_pokemon", []):
+                    self._data.setdefault("target_pokemon", []).append(name)
+                solo = self._data.get("target_only_pokemon", [])
+                if name in solo:
+                    solo.remove(name)
+            self._data["skip_pokemon"] = skip
+        self.save()
+
+    def set_skip(self, pokemon_name, value):
+        if self.is_skipped(pokemon_name) != bool(value):
+            self.toggle_skip(pokemon_name)
+
+    def is_skipped(self, pokemon_name):
+        name = pokemon_name.lower().strip()
+        with self._lock:
+            return name in self._data.get("skip_pokemon", [])
+
+    def get_skipped(self):
+        with self._lock:
+            return list(self._data.get("skip_pokemon", []))
+
+    def get_hunt_targets(self):
+        """Targets that are actually hunted (target list minus skipped).
+        Empty means 'every Pokémon except skipped'."""
+        with self._lock:
+            skip = set(self._data.get("skip_pokemon", []))
+            return [t for t in self._data.get("target_pokemon", []) if t.lower() not in skip]
+
+    def wants_pokemon(self, pokemon_name):
+        """True if this species should be hunted under the target + skip rules."""
+        name = pokemon_name.lower().strip()
+        if self.is_skipped(name):
+            return False
+        hunt = self.get_hunt_targets()
+        return not hunt or name in [t.lower() for t in hunt]
 
 
 config = Config()

@@ -34,6 +34,7 @@ interface PersistShape {
   stats: StatsData;
   events: HuntEvent[];
   lastCatch: LastCatch | null;
+  catchCooldownInfo: any;
   pins: TeleportPin[];
   mode: HunterMode;
 }
@@ -46,6 +47,7 @@ export interface HuntStore {
   stats: StatsData;
   events: HuntEvent[];
   lastCatch: LastCatch | null;
+  catchCooldownInfo: any;
   pins: TeleportPin[];
   hunter: {
     running: boolean;
@@ -66,6 +68,8 @@ export interface HuntStore {
   addTargets: (names: string[], priority: 0 | 1) => { added: string[]; failed: string[] };
   removeTarget: (name: string) => Promise<void>;
   togglePriority: (name: string) => Promise<void>;
+  toggleTargetOnly: (name: string) => Promise<void>;
+  toggleSkip: (name: string) => Promise<void>;
   ingestFeed: (text: string) => { added: number; skipped: number; errors: string[] };
   addMapSpawn: (lat: number, lng: number, pokemon?: string) => boolean;
   clearQueue: () => Promise<void>;
@@ -105,6 +109,7 @@ function pushEvent(
 // --- Local cache for optimistic updates ---
 let _localTargets: TargetPokemon[] = [];
 let _localSettings: Settings = { ...DEFAULT_SETTINGS };
+let _pendingTargetToggle = false;  // Prevents poll from overwriting during toggle
 
 export const useHuntStore = create<HuntStore>((set, get) => ({
   hydrated: false,
@@ -121,6 +126,7 @@ export const useHuntStore = create<HuntStore>((set, get) => ({
     },
   ],
   lastCatch: null,
+  catchCooldownInfo: null,
   pins: [],
   hunter: {
     running: false,
@@ -174,6 +180,7 @@ export const useHuntStore = create<HuntStore>((set, get) => ({
         stats,
         events: events.length > 0 ? events : [{ id: "ev_boot", timestamp: Date.now(), type: "system", message: "No events yet." }],
         lastCatch,
+        catchCooldownInfo: status.catchCooldownInfo,
         pins: map.slice(-MAX_PINS),
         hunter: {
           ...get().hunter,
@@ -222,7 +229,7 @@ export const useHuntStore = create<HuntStore>((set, get) => ({
         }
       }
       if (next.some((t) => t.name === name)) continue;
-      next.push({ name, priority, addedAt: Date.now() });
+      next.push({ name, priority, targetOnly: false, skip: false, addedAt: Date.now() });
       added.push(name);
     }
     _localTargets = next;
@@ -278,6 +285,53 @@ export const useHuntStore = create<HuntStore>((set, get) => ({
       await api.setPriority(lower, newPriority === 0 ? "high" : "low");
     } catch {
       set({ toast: "Failed to update priority" });
+    }
+  },
+
+  toggleTargetOnly: async (name) => {
+    const lower = name.toLowerCase();
+    const current = _localTargets.find((t) => t.name === lower);
+    if (!current) return;
+    const newVal = !current.targetOnly;
+    const next = _localTargets.map((t) =>
+      t.name === lower ? { ...t, targetOnly: newVal, skip: newVal ? false : t.skip } : t,
+    );
+    _localTargets = next;
+    _pendingTargetToggle = true;
+    set({ targets: next });
+    try {
+      await api.toggleTargetOnly(lower);
+    } catch {
+      // Revert on failure
+      const reverted = _localTargets.map((t) =>
+        t.name === lower ? { ...t, targetOnly: !newVal } : t,
+      );
+      _localTargets = reverted;
+      set({ targets: reverted, toast: "Failed to toggle solo mode" });
+    } finally {
+      _pendingTargetToggle = false;
+    }
+  },
+
+  toggleSkip: async (name) => {
+    const lower = name.toLowerCase();
+    const current = _localTargets.find((t) => t.name === lower);
+    if (!current) return;
+    const before = _localTargets;
+    const newVal = !current.skip;
+    const next = _localTargets.map((t) =>
+      t.name === lower ? { ...t, skip: newVal, targetOnly: newVal ? false : t.targetOnly } : t,
+    );
+    _localTargets = next;
+    _pendingTargetToggle = true;
+    set({ targets: next });
+    try {
+      await api.toggleSkip(lower);
+    } catch {
+      _localTargets = before;
+      set({ targets: before, toast: "Failed to toggle skip" });
+    } finally {
+      _pendingTargetToggle = false;
     }
   },
 
@@ -471,7 +525,11 @@ export const useHuntStore = create<HuntStore>((set, get) => ({
         api.getMap(),
       ]);
 
-      _localTargets = targets;
+      // Don't overwrite targets during a pending toggle — prevents race condition
+      // where the poll fetches stale data before the toggle API call completes
+      if (!_pendingTargetToggle) {
+        _localTargets = targets;
+      }
 
       // Don't overwrite settings on every poll — only update from API on hydrate
       // Settings are managed locally and synced via patchSettings API calls
@@ -480,8 +538,9 @@ export const useHuntStore = create<HuntStore>((set, get) => ({
         queue,
         stats,
         events: events.length > 0 ? events : get().events,
-        targets,
+        targets: _pendingTargetToggle ? get().targets : targets,
         lastCatch,
+        catchCooldownInfo: status.catchCooldownInfo,
         pins: map.slice(-MAX_PINS),
         hunter: {
           ...get().hunter,
@@ -490,6 +549,9 @@ export const useHuntStore = create<HuntStore>((set, get) => ({
           loopStep: status.loopStep as LoopStep,
           activity: status.activity,
           currentCoords: status.currentCoords,
+          deviceTemp: status.deviceTemp,
+          deviceTempTime: status.deviceTempTime,
+          deviceName: status.deviceName,
           lastPollAt: Date.now(),
         },
       });

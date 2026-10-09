@@ -119,8 +119,13 @@ function mapStats(raw: any): StatsData {
     shundoTimestamps: toMs(raw.shundo_timestamps),
     hundoIntervals: raw.hundo_intervals ?? [],
     hundosSinceCatch: raw.hundos_since_catch ?? 0,
+    hundosPerHour: raw.hundos_hour ?? 0,
+    shiniesPerHour: raw.shinies_hour ?? 0,
+    shundosPerHour: raw.shundos_hour ?? 0,
+    teleportsPerHour: raw.teleports_hour ?? 0,
     startTime: raw.start_time ? raw.start_time * 1000 : 0,
     stopTime: raw.stop_time ? raw.stop_time * 1000 : 0,
+    elapsedSeconds: raw.elapsed_seconds ?? 0,
     lastCaught: null,
   };
 }
@@ -130,6 +135,8 @@ function mapTargets(raw: any): TargetPokemon[] {
   return raw.targets.map((t: any) => ({
     name: t.name.toLowerCase(),
     priority: t.priority === "high" ? 0 : 1,
+    targetOnly: t.target_only ?? false,
+    skip: t.skip ?? false,
     addedAt: Date.now(),
   }));
 }
@@ -145,6 +152,7 @@ function mapSettings(raw: any): Settings {
     queueLimitPerPokemon: raw.queue_limit_per_pokemon ?? 5,
     clusterSkipThreshold: raw.cluster_skip_threshold ?? 5,
     minDspSeconds: raw.min_dsp_seconds ?? 120,
+    deviceTempIntervalSeconds: raw.device_temp_interval_seconds ?? 30,
     demoFeedEnabled: false,
     backgroundImageUrl: raw.background_image_url ?? "",
     backgroundImageUrlMobile: raw.background_image_url_mobile ?? "",
@@ -213,6 +221,9 @@ export const api = {
       inCooldown: raw.in_cooldown ?? false,
       cooldownRemaining: raw.cooldown_remaining ?? 0,
       catchCooldownInfo: raw.catch_cooldown_info,
+      deviceTemp: raw.device_temp ?? null,
+      deviceTempTime: raw.device_temp_time ?? null,
+      deviceName: raw.device_name ?? null,
     };
   },
 
@@ -288,6 +299,14 @@ export const api = {
     await post(`/api/targets/${encodeURIComponent(name)}/priority?priority=${priority}`);
   },
 
+  async toggleSkip(name: string): Promise<void> {
+    await post(`/api/targets/${encodeURIComponent(name)}/skip`);
+  },
+
+  async toggleTargetOnly(name: string): Promise<void> {
+    await post(`/api/targets/${encodeURIComponent(name)}/target-only`);
+  },
+
   async clearQueue(): Promise<void> {
     await del("/api/queue");
   },
@@ -311,6 +330,7 @@ export const api = {
     if (patch.queueLimitPerPokemon !== undefined) body.queue_limit_per_pokemon = patch.queueLimitPerPokemon;
     if (patch.clusterSkipThreshold !== undefined) body.cluster_skip_threshold = patch.clusterSkipThreshold;
     if (patch.minDspSeconds !== undefined) body.min_dsp_seconds = patch.minDspSeconds;
+    if (patch.deviceTempIntervalSeconds !== undefined) body.device_temp_interval_seconds = patch.deviceTempIntervalSeconds;
     if (patch.backgroundImageUrl !== undefined) body.background_image_url = patch.backgroundImageUrl;
     if (patch.backgroundImageUrlMobile !== undefined) body.background_image_url_mobile = patch.backgroundImageUrlMobile;
     if (patch.notifyUserId !== undefined) body.notify_user_id = patch.notifyUserId;

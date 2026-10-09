@@ -326,8 +326,9 @@ async def api_targets():
             "sprite": get_sprite_url(t),
             "priority": "high" if t in high else "low",
             "target_only": config.is_target_only(t),
+            "skip": config.is_skipped(t),
         })
-    return {"targets": result}
+    return {"targets": result, "hunt_all": not config.get_hunt_targets()}
 
 
 @app.post("/api/targets")
@@ -369,6 +370,12 @@ async def api_set_priority(name: str, priority: str):
 async def api_remove_target(name: str):
     config.remove_target(name)
     return {"status": "ok", "targets": config.get_targets()}
+
+
+@app.post("/api/targets/{name}/skip")
+async def api_toggle_skip(name: str):
+    config.toggle_skip(name)
+    return {"status": "ok", "targets": config.get_targets(), "skipped": config.get_skipped()}
 
 
 @app.post("/api/targets/{name}/target-only")

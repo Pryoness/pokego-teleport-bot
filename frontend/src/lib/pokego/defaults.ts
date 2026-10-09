@@ -3,16 +3,16 @@ import type { QueueTask, StatsData, TargetPokemon } from "./types";
 import { DEFAULT_SETTINGS } from "./types";
 
 export const DEMO_TARGETS: TargetPokemon[] = [
-  { name: "garchomp", priority: 0, addedAt: Date.now() - 3600000 },
-  { name: "axew", priority: 0, addedAt: Date.now() - 3500000 },
-  { name: "dragonite", priority: 0, addedAt: Date.now() - 3400000 },
-  { name: "ralts", priority: 1, addedAt: Date.now() - 3300000 },
-  { name: "bagon", priority: 1, addedAt: Date.now() - 3200000 },
-  { name: "dratini", priority: 1, addedAt: Date.now() - 3100000 },
-  { name: "larvitar", priority: 1, addedAt: Date.now() - 3000000 },
-  { name: "gible", priority: 1, addedAt: Date.now() - 2900000 },
-  { name: "noibat", priority: 1, addedAt: Date.now() - 2800000 },
-  { name: "goomy", priority: 1, addedAt: Date.now() - 2700000 },
+  { name: "garchomp", priority: 0, targetOnly: false, skip: false, addedAt: Date.now() - 3600000 },
+  { name: "axew", priority: 0, targetOnly: false, skip: false, addedAt: Date.now() - 3500000 },
+  { name: "dragonite", priority: 0, targetOnly: false, skip: false, addedAt: Date.now() - 3400000 },
+  { name: "ralts", priority: 1, targetOnly: false, skip: false, addedAt: Date.now() - 3300000 },
+  { name: "bagon", priority: 1, targetOnly: false, skip: false, addedAt: Date.now() - 3200000 },
+  { name: "dratini", priority: 1, targetOnly: false, skip: false, addedAt: Date.now() - 3100000 },
+  { name: "larvitar", priority: 1, targetOnly: false, skip: false, addedAt: Date.now() - 3000000 },
+  { name: "gible", priority: 1, targetOnly: false, skip: false, addedAt: Date.now() - 2900000 },
+  { name: "noibat", priority: 1, targetOnly: false, skip: false, addedAt: Date.now() - 2800000 },
+  { name: "goomy", priority: 1, targetOnly: false, skip: false, addedAt: Date.now() - 2700000 },
 ];
 
 export function emptyStats(): StatsData {
@@ -34,6 +34,10 @@ export function emptyStats(): StatsData {
     shundoTimestamps: [],
     hundoIntervals: [],
     hundosSinceCatch: 0,
+    hundosPerHour: 0,
+    shiniesPerHour: 0,
+    shundosPerHour: 0,
+    teleportsPerHour: 0,
     startTime: 0,
     stopTime: 0,
     lastCaught: null,

@@ -13,7 +13,7 @@ from config import config
 from stats import stats, haversine_km
 from queue_manager import queue, TargetTask
 from browser import SXBrowser
-from shundo import ShundoManager, parse_alert, parse_coords, species_matches_targets, normalize_species
+from shundo import ShundoManager, parse_alert, parse_coords, species_matches_targets, normalize_species, _species_in
 from pokemon_data import is_valid_pokemon, get_sprite_url
 
 # Path for channel success rate log
@@ -132,6 +132,7 @@ class PokeBot:
         print("    @bot caught                     Show caught Pokemon")
         print("    @bot channels                   Show per-channel success rates")
         print("    @bot shundos                    Show PokeX shundo plan")
+        print("    @bot skip <pokemon,...>         Ignore Pokémon (unskip to undo)")
         print("    @bot start                      Start monitoring")
         print("    @bot stop                       Stop monitoring")
         print("    @bot status                     Show current status")
@@ -217,7 +218,7 @@ class PokeBot:
                 if parts and parts[0].lower() in (
                     "add", "remove", "targets", "queue", "clear", "stats",
                     "caught", "start", "stop", "status", "set", "help", "priority",
-                    "channels", "shundos",
+                    "channels", "shundos", "skip", "unskip",
                 ):
                     await self._handle_command(message, parts)
                     return
@@ -265,9 +266,9 @@ class PokeBot:
         if left <= 0:
             print(f"[Shundo] {alert['name']} already despawned — ignoring")
             return
-        targets = config.get_targets()
-        if not species_matches_targets(alert["species"], targets):
-            print(f"[Shundo] {alert['name']} not in target list — skipping")
+        if not species_matches_targets(alert["species"], config.get_targets(), config.get_skipped()):
+            why = "on skip list" if _species_in(alert["species"], config.get_skipped()) else "not in target list"
+            print(f"[Shundo] {alert['name']} {why} — skipping")
             self.shundos.log("skipped_not_target", dict(alert, msg_id=str(message.id)))
             return
         entry = self.shundos.add(message.id, alert, message.channel.id)
@@ -367,6 +368,18 @@ class PokeBot:
         """Pick the next shundo per the max-catch plan.
         Returns (task, coords, wait_info) — task None + wait_info when we must wait for cooldown."""
         self.shundos.expire()
+        targets, skipped = config.get_targets(), config.get_skipped()
+        for e in self.shundos.entries.values():
+            ok = species_matches_targets(e["species"], targets, skipped)
+            if e["status"] in ("pending", "pending_coords") and not ok:
+                e["status_before_skip"] = e["status"]
+                e["status"] = "skipped_list"
+                self.shundos._plan_cache = None
+                print(f"[Shundo] {e['name']} now excluded by target/skip list — dropped from plan")
+            elif e["status"] == "skipped_list" and ok:
+                e["status"] = e.pop("status_before_skip", "pending")
+                self.shundos._plan_cache = None
+                print(f"[Shundo] {e['name']} allowed again by target/skip list — back in plan")
         if not self.shundos.pending():
             return None, None, None
         plan = self.shundos.plan(
@@ -505,6 +518,7 @@ class PokeBot:
                 "`@bot caught` - Show caught Pokemon\n"
                 "`@bot channels` - Show per-channel success rates\n"
                 "`@bot shundos` - Show pending PokeX shundos and the catch plan\n"
+                "`@bot skip <pokemon, ...>` / `@bot unskip <pokemon>` - Ignore list (all targets skipped = hunt everything else)\n"
                 "`@bot start` - Start monitoring\n"
                 "`@bot stop` - Stop monitoring\n"
                 "`@bot status` - Show current status\n"
@@ -565,14 +579,42 @@ class PokeBot:
         elif cmd == "targets":
             targets = config.get_targets()
             high = config.get_high_priority()
+            skipped = config.get_skipped()
+            solo = config.get("target_only_pokemon", [])
             if targets:
                 lines = ["**Target Pokemon:**"]
                 for t in targets:
-                    tag = " (HIGH)" if t in high else ""
+                    tag = " (SKIP)" if t in skipped else (" (HIGH)" if t in high else "")
+                    if t in solo:
+                        tag += " (SOLO)"
                     lines.append(f"• {t}{tag}")
-                await self._send(message.channel, "\n".join(lines))
+                if not config.get_hunt_targets():
+                    lines.append("_All targets are skipped — hunting every other Pokémon._")
+                await self._send(message.channel, "\n".join(lines)[:1900])
             else:
-                await self._send(message.channel, "No targets set. Use `@bot add target <pokemon>`")
+                await self._send(message.channel, "No targets set — hunting every Pokémon. Use `@bot add target <pokemon>` or `@bot skip <pokemon>`")
+
+        elif cmd in ("skip", "unskip"):
+            if args:
+                names = [n.strip().lower() for n in " ".join(args).split(",") if n.strip()]
+                done, failed = [], []
+                for n in names:
+                    if not is_valid_pokemon(n):
+                        failed.append(n)
+                        continue
+                    config.set_skip(n, cmd == "skip")
+                    done.append(n)
+                msg = []
+                if done:
+                    msg.append(f"{'Skipping' if cmd == 'skip' else 'No longer skipping'}: {', '.join(done)}")
+                    hunt = config.get_hunt_targets()
+                    msg.append(f"Hunting: {', '.join(hunt) if hunt else 'every Pokémon except skipped'}")
+                if failed:
+                    msg.append(f"Invalid: {', '.join(failed)}")
+                await self._send(message.channel, "\n".join(msg))
+            else:
+                sk = config.get_skipped()
+                await self._send(message.channel, f"Skip list: {', '.join(sk) or 'empty'}\nUsage: `@bot skip <pokemon1, pokemon2>` / `@bot unskip <pokemon>`")
 
         elif cmd == "queue":
             q = queue.get_queue()
@@ -640,7 +682,7 @@ class PokeBot:
                 await self._send(message.channel, 
                     "No watch channel set! Use `@bot set watch <channel_id>` first."
                 )
-            elif not config.get_targets():
+            elif not config.get_hunt_targets() and not config.get("shundo_dm_enabled", True):
                 await self._send(message.channel, 
                     "No target Pokemon set! Use `@bot add target <pokemon>` first."
                 )
@@ -652,10 +694,10 @@ class PokeBot:
                 # Start background log scanner for passive hundo/shiny tracking
                 if self._bg_scanner_task is None or self._bg_scanner_task.done():
                     self._bg_scanner_task = asyncio.create_task(self._background_log_scanner())
-                targets = config.get_targets()
+                targets = config.get_hunt_targets()
                 await self._send(message.channel, 
                     f"Started monitoring channel `{config.get('watch_channel_id')}` "
-                    f"for: {', '.join(targets)}\n"
+                    f"for: {', '.join(targets) or 'every Pokémon except skipped'}\n"
                     f"Targets in queue: {queue.size()}"
                 )
 
@@ -833,6 +875,8 @@ class PokeBot:
             print(f"[Worker] Error fetching evolution chain for {name}: {e}")
         # Remove all from targets, high priority, and queue
         for p in to_remove:
+            if config.is_skipped(p):
+                continue  # keep skip entries on the list
             config.remove_target(p)
             removed = queue.remove_pokemon(p)
             if removed:
@@ -1049,7 +1093,7 @@ class PokeBot:
 
     async def _check_for_targets(self, message):
         """Check if a message in the watch channel contains target Pokemon keywords."""
-        targets = config.get_targets()
+        targets = config.get_hunt_targets()  # target list minus skipped
         if not targets:
             return
 
@@ -1330,7 +1374,7 @@ class PokeBot:
                                     print(f"[BgScanner] Removed {purged} queued {caught_name} (caught by SX CatchRules)")
                                 # If caught Pokemon is a hundo/shundo and in target list, remove from targets
                                 is_hundo_or_shundo = nt_iv_pct == 100 or (nt_shiny and nt_iv_pct == 100)
-                                if is_hundo_or_shundo and caught_name.lower() in [t.lower() for t in config.get_targets()]:
+                                if is_hundo_or_shundo and caught_name.lower() in [t.lower() for t in config.get_hunt_targets()]:
                                     if config.get("auto_remove_caught", True):
                                         if config.get("remove_evolution_line", False):
                                             self._remove_evolution_line(caught_name, queue)
@@ -1448,6 +1492,11 @@ class PokeBot:
             # regular catch can't move the catch location and break the plan.
             if config.get("shundo_pause_queue", True) and self.shundos.has_active():
                 return None, None
+
+        for _sk in config.get_skipped():
+            if queue.get_pokemon_count(_sk):
+                n = queue.remove_pokemon(_sk)
+                print(f"[Worker] Removed {n} queued {_sk} (on skip list)")
 
         all_tasks = queue.peek_all()
         if not all_tasks:
@@ -2041,7 +2090,7 @@ class PokeBot:
                     # If the caught Pokemon is a hundo or shundo and is in the
                     # target list, remove it — we already got what we needed.
                     is_hundo_or_shundo = nt_iv_pct == 100 or (nt_shiny and nt_iv_pct == 100)
-                    if is_hundo_or_shundo and nt_name.lower() in [t.lower() for t in config.get_targets()]:
+                    if is_hundo_or_shundo and nt_name.lower() in [t.lower() for t in config.get_hunt_targets()]:
                         print(f"[Worker] Non-target catch {nt_name} is in target list (IV={nt_iv_pct}%, shiny={nt_shiny}) — removing from targets and queue")
                         if config.get("auto_remove_caught", True):
                             if config.get("remove_evolution_line", False):

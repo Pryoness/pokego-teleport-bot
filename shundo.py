@@ -77,18 +77,30 @@ def _latlng(coords):
     return float(a), float(b)
 
 
-def species_matches_targets(species, targets):
-    """Respect the target list; an empty list means 'everything'."""
-    if not targets:
-        return True
+def _species_in(species, names):
     sp = species.replace("-", " ")
-    for t in targets:
+    for t in names or []:
         tn = normalize_species(t).replace("-", " ")
         if not tn:
             continue
         if sp == tn or re.search(r"\b" + re.escape(tn) + r"\b", sp):
             return True
     return False
+
+
+def species_matches_targets(species, targets, skipped=None):
+    """Target list + skip (ignore) list rules:
+    - a skipped species never matches
+    - hunt list = targets minus skipped; if that's empty, everything else matches
+    """
+    skipped = skipped or []
+    if _species_in(species, skipped):
+        return False
+    skip_norm = {normalize_species(x) for x in skipped}
+    hunt = [t for t in (targets or []) if normalize_species(t) not in skip_norm]
+    if not hunt:
+        return True
+    return _species_in(species, hunt)
 
 
 # ─────────────────────────── planner ───────────────────────────
