@@ -41,6 +41,7 @@ DEFAULTS = {
     "dm_delay_min_seconds": 2,
     "dm_delay_max_seconds": 5,
     "min_dsp_seconds": 120,  # Skip targets with DSP below this (spawn likely gone)
+    "device_temp_interval_seconds": 30,  # Seconds between iPad temp reports to the dashboard
 }
 
 

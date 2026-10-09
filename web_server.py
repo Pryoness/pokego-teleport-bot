@@ -9,6 +9,7 @@ import hashlib
 from fastapi import FastAPI, HTTPException, Request, Response, Depends
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.responses import Response
 from pydantic import BaseModel
 from typing import Optional
 from pathlib import Path
@@ -81,8 +82,8 @@ async def auth_middleware(request: Request, call_next):
     Monitor mode: GET requests allowed with monitor cookie, all mutations blocked."""
     path = request.url.path
     method = request.method
-    # Skip auth for login/monitor-login endpoints and non-API routes
-    if path in ("/api/login", "/api/monitor-login") or not path.startswith("/api/"):
+    # Skip auth for login/monitor-login endpoints, device-temp (iPad POSTs), and non-API routes
+    if path in ("/api/login", "/api/monitor-login", "/api/device-temp", "/api/device-temp-interval") or not path.startswith("/api/"):
         return await call_next(request)
     # If no auth configured, allow everything
     if _AUTH_CREDENTIALS is None:
@@ -179,6 +180,7 @@ class SettingsUpdate(BaseModel):
     additional_watch_channels: Optional[str] = None  # Comma-separated channel IDs
     cluster_skip_threshold: Optional[int] = None
     min_dsp_seconds: Optional[int] = None  # Skip targets with DSP below this (default 120)
+    device_temp_interval_seconds: Optional[int] = None  # iPad temp report interval (default 30)
     background_image_url: Optional[str] = None  # Custom dashboard background image (desktop)
     background_image_url_mobile: Optional[str] = None  # Custom dashboard background image (mobile)
 
@@ -213,7 +215,9 @@ if _web_static.exists():
 
 @app.get("/")
 async def index():
-    return FileResponse(os.path.join(WEB_DIR, "index.html"))
+    with open(os.path.join(WEB_DIR, "index.html"), "r") as f:
+        content = f.read()
+    return Response(content=content, media_type="text/html", headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
 
 
 # --- API Routes (must come before SPA fallback) ---
@@ -237,12 +241,35 @@ async def api_status():
         "current_activity": activity,
         "loop_step": loop_step,
         "paused": paused,
+        "device_temp": getattr(app.state, "device_temp", None),
+        "device_temp_time": getattr(app.state, "device_temp_time", None),
+        "device_name": getattr(app.state, "device_name", None),
     }
 
 
 @app.get("/api/last_catch")
 async def api_last_catch():
     return stats.get_last_catch()
+
+
+@app.post("/api/device-temp")
+async def api_device_temp(payload: dict):
+    """Receive temperature data from the iPad tweak."""
+    temp = payload.get("temperature")
+    device = payload.get("device", "Unknown")
+    # Accept null temperature — tweak is alive but couldn't read sensor
+    if temp is not None:
+        app.state.device_temp = round(float(temp), 1)
+    app.state.device_temp_time = time.time()
+    app.state.device_name = device
+    return {"status": "ok", "temperature": getattr(app.state, "device_temp", None)}
+
+
+@app.get("/api/device-temp-interval")
+async def api_device_temp_interval():
+    """Return the current temp-report interval so the iPad daemon can adjust itself.
+    Kept unauthenticated so the device can poll without dashboard login."""
+    return {"interval_seconds": int(config.get("device_temp_interval_seconds", 30))}
 
 
 @app.post("/api/last_catch")
@@ -352,6 +379,9 @@ async def api_toggle_target_only(name: str):
 
 @app.get("/api/queue")
 async def api_queue():
+    # Proactively remove targets below min DSP before returning to dashboard
+    min_dsp = config.get("min_dsp_seconds", 120)
+    queue.cleanup_below_dsp(min_dsp)
     return {"queue": queue.get_queue(), "size": queue.size()}
 
 
@@ -498,4 +528,6 @@ async def spa_fallback(path: str):
     file_path = Path(WEB_DIR) / path
     if file_path.is_file():
         return FileResponse(str(file_path))
-    return FileResponse(os.path.join(WEB_DIR, "index.html"))
+    with open(os.path.join(WEB_DIR, "index.html"), "r") as f:
+        content = f.read()
+    return Response(content=content, media_type="text/html", headers={"Cache-Control": "no-cache, no-store, must-revalidate"})

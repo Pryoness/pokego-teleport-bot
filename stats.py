@@ -10,6 +10,9 @@ from collections import defaultdict
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 STATS_PATH = os.path.join(SCRIPT_DIR, "stats.json")
 MAX_EVENTS = 200
+MAX_DEDUP_LOGGED = 10000  # Max encounter IDs to keep in memory
+MAX_DEDUP_SAVE = 10000    # Max encounter IDs to persist to disk
+MAX_TIMESTAMPS = 5000    # Max timestamps per type (enough for ~125hrs at 40/hr)
 
 # Cooldown chart: (min_distance_km, cooldown_seconds)
 # Based on the user-provided cooldown chart. Max 2 hours (7200s).
@@ -79,6 +82,7 @@ class StatsTracker:
         self._caught_encounter_ids = set()  # Separate dedup for catches
         self._is_running = False
         self.load()
+        self._load_dedup_ids()
 
     def _default(self):
         return {
@@ -153,6 +157,33 @@ class StatsTracker:
                     json.dump(cfg, f, indent=4)
             except Exception as e:
                 print(f"[Stats] Warning: could not save to config.json: {e}")
+            # Also persist dedup IDs
+            self._save_dedup_ids()
+
+    def _load_dedup_ids(self):
+        """Load encounter IDs from disk so dedup survives restarts."""
+        dedup_path = os.path.join(SCRIPT_DIR, "dedup_ids.json")
+        try:
+            if os.path.exists(dedup_path):
+                with open(dedup_path, "r") as f:
+                    data = json.load(f)
+                self._logged_encounter_ids = set(data.get("logged", []))
+                self._caught_encounter_ids = set(data.get("caught", []))
+                print(f"[Stats] Loaded {len(self._logged_encounter_ids)} logged + {len(self._caught_encounter_ids)} caught dedup IDs from disk")
+        except Exception as e:
+            print(f"[Stats] Warning: could not load dedup IDs: {e}")
+
+    def _save_dedup_ids(self):
+        """Persist encounter IDs to disk so dedup survives restarts."""
+        dedup_path = os.path.join(SCRIPT_DIR, "dedup_ids.json")
+        try:
+            with open(dedup_path, "w") as f:
+                json.dump({
+                    "logged": list(self._logged_encounter_ids)[-MAX_DEDUP_SAVE:],
+                    "caught": list(self._caught_encounter_ids)[-MAX_DEDUP_SAVE:],
+                }, f)
+        except Exception as e:
+            print(f"[Stats] Warning: could not save dedup IDs: {e}")
 
     def _add_event(self, event_type, message, details=None):
         event = {
@@ -202,9 +233,9 @@ class StatsTracker:
             now = time.time()
             self._data["total_teleports"] += 1
             self._data["teleport_timestamps"].append(now)
-            # Keep only last 1000
-            if len(self._data["teleport_timestamps"]) > 1000:
-                self._data["teleport_timestamps"] = self._data["teleport_timestamps"][-1000:]
+            # Keep only last MAX_TIMESTAMPS
+            if len(self._data["teleport_timestamps"]) > MAX_TIMESTAMPS:
+                self._data["teleport_timestamps"] = self._data["teleport_timestamps"][-MAX_TIMESTAMPS:]
             self._add_event("teleport", f"Teleported to {pokemon} at {coords}")
             # Parse coords string "lat, lng"
             try:
@@ -229,11 +260,15 @@ class StatsTracker:
             # Deduplicate by encounter_id — prevents double-counting
             if encounter_id:
                 if encounter_id in self._logged_encounter_ids:
+                    print(f"[Stats] Dedup: encounter {encounter_id} ({pokemon}) already logged — skipping")
                     return  # Already logged this encounter
                 self._logged_encounter_ids.add(encounter_id)
-                if len(self._logged_encounter_ids) > 2000:
+                if len(self._logged_encounter_ids) > MAX_DEDUP_LOGGED:
                     # Keep only recent IDs to prevent unbounded growth
-                    self._logged_encounter_ids = set(list(self._logged_encounter_ids)[-1000:])
+                    self._logged_encounter_ids = set(list(self._logged_encounter_ids)[-MAX_DEDUP_SAVE:])
+                # Persist dedup IDs every 10 encounters
+                if len(self._logged_encounter_ids) % 10 == 0:
+                    self._save_dedup_ids()
             now = time.time()
             name = pokemon.lower()
             self._data["encountered_pokemon"][name] = self._data["encountered_pokemon"].get(name, 0) + 1
@@ -243,8 +278,8 @@ class StatsTracker:
             if shiny:
                 self._data["total_shinies"] += 1
                 self._data["shiny_timestamps"].append(now)
-                if len(self._data["shiny_timestamps"]) > 500:
-                    self._data["shiny_timestamps"] = self._data["shiny_timestamps"][-500:]
+                if len(self._data["shiny_timestamps"]) > MAX_TIMESTAMPS:
+                    self._data["shiny_timestamps"] = self._data["shiny_timestamps"][-MAX_TIMESTAMPS:]
             
             # Check for hundo (100% IV)
             is_hundo = iv_percent == 100 or (iv and "100%" in str(iv))
@@ -252,8 +287,8 @@ class StatsTracker:
                 self._data["total_hundos"] += 1
                 self._data["hundos_since_catch"] += 1
                 self._data["hundo_timestamps"].append(now)
-                if len(self._data["hundo_timestamps"]) > 500:
-                    self._data["hundo_timestamps"] = self._data["hundo_timestamps"][-500:]
+                if len(self._data["hundo_timestamps"]) > MAX_TIMESTAMPS:
+                    self._data["hundo_timestamps"] = self._data["hundo_timestamps"][-MAX_TIMESTAMPS:]
                 # Track time-to-hundo (from last teleport)
                 if self._data["teleport_timestamps"]:
                     interval = now - self._data["teleport_timestamps"][-1]
@@ -267,8 +302,8 @@ class StatsTracker:
             if shiny and is_hundo:
                 self._data["total_shundos"] += 1
                 self._data["shundo_timestamps"].append(now)
-                if len(self._data["shundo_timestamps"]) > 100:
-                    self._data["shundo_timestamps"] = self._data["shundo_timestamps"][-100:]
+                if len(self._data["shundo_timestamps"]) > MAX_TIMESTAMPS:
+                    self._data["shundo_timestamps"] = self._data["shundo_timestamps"][-MAX_TIMESTAMPS:]
             
             iv_str = iv or "unknown"
             shiny_str = " shiny" if shiny else ""
@@ -297,9 +332,12 @@ class StatsTracker:
             # but coords above were already updated.
             if encounter_id:
                 if encounter_id in self._caught_encounter_ids:
+                    print(f"[Stats] Dedup: catch {encounter_id} ({pokemon}) already logged — skipping")
                     self.save()
                     return  # Already counted in stats
                 self._caught_encounter_ids.add(encounter_id)
+                if len(self._caught_encounter_ids) % 10 == 0:
+                    self._save_dedup_ids()
             name = pokemon.lower()
             display = pokemon.replace("-", " ").title()
             self._data["total_caught"] += 1
@@ -327,25 +365,24 @@ class StatsTracker:
                 self._data["total_hundos"] += 1
                 self._data["hundos_since_catch"] += 1
                 self._data["hundo_timestamps"].append(now)
-                if len(self._data["hundo_timestamps"]) > 500:
-                    self._data["hundo_timestamps"] = self._data["hundo_timestamps"][-500:]
+                if len(self._data["hundo_timestamps"]) > MAX_TIMESTAMPS:
+                    self._data["hundo_timestamps"] = self._data["hundo_timestamps"][-MAX_TIMESTAMPS:]
                 if not is_target:
                     self._data["total_non_target_hundos"] += 1
             if shiny and not already_encountered:
                 self._data["total_shinies"] += 1
                 self._data["shiny_timestamps"].append(now)
-                if len(self._data["shiny_timestamps"]) > 500:
-                    self._data["shiny_timestamps"] = self._data["shiny_timestamps"][-500:]
+                if len(self._data["shiny_timestamps"]) > MAX_TIMESTAMPS:
+                    self._data["shiny_timestamps"] = self._data["shiny_timestamps"][-MAX_TIMESTAMPS:]
             is_shundo = shiny and is_hundo
             if is_shundo and not already_encountered:
                 self._data["total_shundos"] += 1
                 self._data["shundo_timestamps"].append(now)
-                if len(self._data["shundo_timestamps"]) > 100:
-                    self._data["shundo_timestamps"] = self._data["shundo_timestamps"][-100:]
-            # Reset cumulative hundo counter on catch — BUT NOT on shundo catches.
-            # A shundo is the best outcome and shouldn't reset the shiny odds.
-            if not is_shundo:
-                self._data["hundos_since_catch"] = 0
+                if len(self._data["shundo_timestamps"]) > MAX_TIMESTAMPS:
+                    self._data["shundo_timestamps"] = self._data["shundo_timestamps"][-MAX_TIMESTAMPS:]
+            # Reset cumulative hundo counter on every catch (including shundos).
+            # The user wants the shiny % probability tracker to reset after a shundo.
+            self._data["hundos_since_catch"] = 0
             iv_str = iv or "unknown"
             shiny_str = " shiny" if shiny else ""
             target_str = "" if is_target else " (non-target)"
@@ -527,18 +564,47 @@ class StatsTracker:
             shiny_ts = self._data.get("shiny_timestamps", [])
             shundo_ts = self._data.get("shundo_timestamps", [])
             
-            # Use elapsed time for per-hour averages
-            elapsed_secs = data.get("elapsed_seconds", 0)
-            elapsed_hours = max(elapsed_secs / 3600, 0.0167)  # min 1 minute
+            # Calculate elapsed time FIRST, before using it for per-hour rates
+            start = self._data.get("start_time", 0)
+            if start > 0:
+                if self._is_running:
+                    elapsed = int(time.time() - start)
+                else:
+                    stop = self._data.get("stop_time", 0)
+                    if stop > 0:
+                        elapsed = int(stop - start)
+                    else:
+                        elapsed = int(time.time() - start)
+            else:
+                elapsed = 0
+            data["elapsed_seconds"] = elapsed
+            data["elapsed_display"] = f"{elapsed // 3600}h {(elapsed % 3600) // 60}m {elapsed % 60}s" if elapsed > 0 else "Not started"
             
-            data["teleports_hour"] = round(len(tp_ts) / elapsed_hours, 1)
+            # Use elapsed time for per-hour averages
+            # Minimum 1 hour to avoid inflating rates for short sessions
+            elapsed_secs = elapsed
+            elapsed_hours = max(elapsed_secs / 3600, 1.0)
+            
+            # Per-hour rates: use the uncapped total_* counters for accuracy.
+            # The timestamp lists are capped (MAX_TIMESTAMPS), so using len() would
+            # undercount once the cap is reached. The total_* counters are running
+            # accumulators that never cap, so they give the true per-hour rate.
+            #
+            # For daily counts, we still use timestamps (filtered to last 24h).
+            # The increased MAX_TIMESTAMPS (5000) ensures we have enough history.
+            total_tp_count = self._data.get("total_teleports", 0)
+            total_hundo_count = self._data.get("total_hundos", 0)
+            total_shiny_count = self._data.get("total_shinies", 0)
+            total_shundo_count = self._data.get("total_shundos", 0)
+            
+            data["teleports_hour"] = round(total_tp_count / elapsed_hours, 1)
             data["teleports_day"] = sum(1 for t in tp_ts if t >= day_ago)
-            data["hundos_hour"] = round(len(hundo_ts) / elapsed_hours, 1)
+            data["hundos_hour"] = round(total_hundo_count / elapsed_hours, 1)
             data["hundos_day"] = sum(1 for t in hundo_ts if t >= day_ago)
             data["total_non_target_hundos"] = self._data.get("total_non_target_hundos", 0)
-            data["shinies_hour"] = round(len(shiny_ts) / elapsed_hours, 1)
+            data["shinies_hour"] = round(total_shiny_count / elapsed_hours, 1)
             data["shinies_day"] = sum(1 for t in shiny_ts if t >= day_ago)
-            data["shundos_hour"] = round(len(shundo_ts) / elapsed_hours, 1)
+            data["shundos_hour"] = round(total_shundo_count / elapsed_hours, 1)
             data["shundos_day"] = sum(1 for t in shundo_ts if t >= day_ago)
             
             # Percentages
@@ -563,22 +629,7 @@ class StatsTracker:
             else:
                 data["avg_time_to_hundo"] = 0
             
-            # Elapsed time since bot started — freezes when stopped
-            start = self._data.get("start_time", 0)
-            if start > 0:
-                if self._is_running:
-                    elapsed = int(time.time() - start)
-                else:
-                    stop = self._data.get("stop_time", 0)
-                    if stop > 0:
-                        elapsed = int(stop - start)
-                    else:
-                        elapsed = int(time.time() - start)
-                data["elapsed_seconds"] = elapsed
-                data["elapsed_display"] = f"{elapsed // 3600}h {(elapsed % 3600) // 60}m {elapsed % 60}s"
-            else:
-                data["elapsed_seconds"] = 0
-                data["elapsed_display"] = "Not started"
+            # Elapsed time is already calculated above
             
             return data
 

@@ -175,6 +175,24 @@ class QueueManager:
                 else:
                     remaining.append((priority, neg_expires, counter, task))
             self._heap = remaining
+            return removed
+
+    def cleanup_below_dsp(self, min_seconds):
+        """Remove tasks whose DSP remaining is below min_seconds.
+        Returns list of removed tasks (for stats logging)."""
+        with self._lock:
+            remaining = []
+            removed = []
+            for entry in self._heap:
+                priority, neg_expires, counter, task = entry
+                key = task.message_id or task._counter_key
+                if task.remaining_seconds < min_seconds:
+                    if key in self._all_tasks:
+                        del self._all_tasks[key]
+                    removed.append(task)
+                else:
+                    remaining.append(entry)
+            self._heap = remaining
             heapq.heapify(self._heap)
             return removed
 

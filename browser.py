@@ -4,6 +4,7 @@ import re
 import math
 import asyncio
 from playwright.async_api import async_playwright
+from pokemon_data import get_pokemon_id, get_name_by_id
 
 
 def offset_coordinate(coords_str, meters=80):
@@ -497,31 +498,64 @@ class SXBrowser:
                 except Exception as e:
                     print(f"[Browser] Method 1 failed (#community-coord): {e}")
             else:
-                # /7/ URLs: try page text regex first (fast, always works)
+                # /7/ URLs: coordinates are loaded via JS after page load.
+                # Poll for up to 10 seconds waiting for the coord input to be populated.
                 try:
-                    text = await page.inner_text("body")
-                    match = re.search(r'(-?\d+\.\d+),\s*(-?\d+\.\d+)', text)
-                    if match:
-                        coords = f"{match.group(1)},{match.group(2)}"
-                        if re.match(r'^-?\d+\.\d+,-?\d+\.\d+$', coords):
-                            print(f"[Browser] Found coordinates (/7/ page text): {coords}")
-                            return coords
+                    for attempt in range(20):  # 20 x 500ms = 10 seconds max
+                        await asyncio.sleep(0.5)
+                        
+                        # Try all input elements (not just type=text — could be readonly, hidden, etc.)
+                        inputs = await page.query_selector_all("input")
+                        for i, inp in enumerate(inputs):
+                            value = await inp.get_attribute("value")
+                            if value and re.match(r'^-?\d+\.\d+,\s*-?\d+\.\d+$', value.strip()):
+                                coords = value.strip()
+                                print(f"[Browser] Found coordinates (/7/ input {i}, attempt {attempt}): {coords}")
+                                return coords
+                        
+                        # Also try JS evaluation — some sites set values via JS that get_attribute misses
+                        try:
+                            js_value = await page.evaluate('''() => {
+                                const inputs = document.querySelectorAll("input");
+                                for (const inp of inputs) {
+                                    if (inp.value && /^-?\d+\.\d+,\s*-?\d+\.\d+$/.test(inp.value.trim())) {
+                                        return inp.value.trim();
+                                    }
+                                }
+                                // Also check for coords in any element's text
+                                const all = document.querySelectorAll("*");
+                                for (const el of all) {
+                                    const text = el.textContent || "";
+                                    const match = text.match(/(-?\d+\.\d+),\s*(-?\d+\.\d+)/);
+                                    if (match) {
+                                        const coords = match[1] + "," + match[2];
+                                        if (/^-?\d+\.\d+,-?\d+\.\d+$/.test(coords)) return coords;
+                                    }
+                                }
+                                return null;
+                            }''')
+                            if js_value:
+                                print(f"[Browser] Found coordinates (/7/ JS eval, attempt {attempt}): {js_value}")
+                                return js_value
+                        except Exception:
+                            pass
+                    
+                    print("[Browser] No coordinates found after 10s of polling /7/ page")
                 except Exception as e:
-                    print(f"[Browser] /7/ page text failed: {e}")
-                print("[Browser] No coordinates found in /7/ page text")
+                    print(f"[Browser] /7/ polling failed: {e}")
 
-            # Method 2: any text input with coordinate-like value
-            try:
-                inputs = await page.query_selector_all("input[type='text']")
-                print(f"[Browser] Found {len(inputs)} text inputs on page")
-                for i, inp in enumerate(inputs):
-                    value = await inp.get_attribute("value")
-                    if value and re.match(r'^-?\d+\.\d+,\s*-?\d+\.\d+$', value.strip()):
-                        print(f"[Browser] Found coordinates (method 2, input {i}): {value.strip()}")
-                        return value.strip()
-                print("[Browser] No coordinate-like values in text inputs")
-            except Exception as e:
-                print(f"[Browser] Method 2 failed (text inputs): {e}")
+            # Method 2: any input with coordinate-like value (for non-/7/ URLs)
+            if not is_v7_url:
+                try:
+                    inputs = await page.query_selector_all("input")
+                    print(f"[Browser] Found {len(inputs)} inputs on page")
+                    for i, inp in enumerate(inputs):
+                        value = await inp.get_attribute("value")
+                        if value and re.match(r'^-?\d+\.\d+,\s*-?\d+\.\d+$', value.strip()):
+                            print(f"[Browser] Found coordinates (method 2, input {i}): {value.strip()}")
+                            return value.strip()
+                except Exception as e:
+                    print(f"[Browser] Method 2 failed (inputs): {e}")
 
             # Method 3: regex on page body text
             try:
@@ -885,18 +919,248 @@ class SXBrowser:
         else:
             print("[Browser] WARNING: Could not find Walk button")
 
+    async def restart_game(self):
+        """Click the ×/stop button on the SX dashboard to restart the game session.
+        Returns True if the button was found and clicked, False otherwise."""
+        page = self.logs_page or self.page
+        if not page:
+            print("[Browser] No page available for restart_game")
+            return False
+        try:
+            await page.bring_to_front()
+            await page.wait_for_timeout(1000)  # Let the page settle
+
+            # Strategy 1: Look for the pogo-btn in the status bar — this is the
+            # play/stop toggle. When the game is running, clicking it stops the
+            # game, which causes it to auto-restart. This is the button the user
+            # confirmed works for resetting the game.
+            for selector in [
+                '.sx-statusbar__pogo-btn:not(.is-disabled)',
+                '.sx-statusbar__pogo-btn.is-stop',
+                'span[role="button"][title*="Stop"]',
+                'span[role="button"][title*="Restart"]',
+                'span[role="button"][title*="Close"]',
+                '.sx-statusbar__close',
+                '.sx-statusbar__x',
+            ]:
+                try:
+                    el = await page.query_selector(selector)
+                    if el:
+                        box = await el.bounding_box()
+                        if box and box['y'] < 60:
+                            await el.click()
+                            print(f"[Browser] Clicked SX restart via selector: {selector}")
+                            await page.wait_for_timeout(5000)
+                            # If a confirmation dialog appears, accept it
+                            for _ in range(3):
+                                try:
+                                    dialog = await page.query_selector('button:has-text("Yes"), button:has-text("OK"), button:has-text("Confirm"), button:has-text("Restart")')
+                                    if dialog:
+                                        await dialog.click()
+                                        print("[Browser] Confirmed restart dialog")
+                                        break
+                                except Exception:
+                                    pass
+                                await page.wait_for_timeout(1000)
+                            # After stopping, try to click Start to restart the game
+                            await page.wait_for_timeout(3000)
+                            for start_selector in [
+                                '.sx-statusbar__pogo-btn:not(.is-disabled)',
+                                '.sx-statusbar__pogo-btn.is-start:not(.is-disabled)',
+                                'span[role="button"][title*="Start"]',
+                                'span[role="button"][title*="Play"]',
+                            ]:
+                                try:
+                                    start_el = await page.query_selector(start_selector)
+                                    if start_el:
+                                        start_box = await start_el.bounding_box()
+                                        if start_box and start_box['y'] < 60:
+                                            await start_el.click()
+                                            print(f"[Browser] Clicked Start via selector: {start_selector}")
+                                            break
+                                except Exception:
+                                    continue
+                            await page.wait_for_timeout(25000)  # Wait for restart
+                            # Reload the logs page to force a fresh WebSocket connection
+                            # after the game restart — the dashboard WebSocket goes stale
+                            try:
+                                logs_url = self.config.get("sx_logs_url")
+                                if logs_url and self.logs_page:
+                                    await self.logs_page.goto(logs_url, wait_until="domcontentloaded")
+                                    await self.logs_page.wait_for_timeout(5000)  # Wait for WebSocket
+                                    print("[Browser] Reloaded logs page after game restart")
+                            except Exception as reload_err:
+                                print(f"[Browser] Error reloading logs page after restart: {reload_err}")
+                            return True
+                except Exception:
+                    continue
+
+            # Strategy 2: Click the status bar head to open a dropdown menu
+            # The dropdown may contain a restart/stop option
+            try:
+                head = await page.query_selector('.sx-statusbar__head')
+                if head:
+                    await head.click()
+                    await page.wait_for_timeout(2000)
+                    # Look for restart/stop option in the dropdown
+                    for text in ['Restart', 'Stop', '×', 'Close', 'Kill', 'Disconnect']:
+                        try:
+                            btn = await page.query_selector(f'button:has-text("{text}"), a:has-text("{text}"), [role="menuitem"]:has-text("{text}")')
+                            if btn:
+                                await btn.click()
+                                print(f"[Browser] Clicked '{text}' in status bar dropdown")
+                                await page.wait_for_timeout(5000)
+                                # Accept any confirmation
+                                for _ in range(3):
+                                    try:
+                                        dialog = await page.query_selector('button:has-text("Yes"), button:has-text("OK"), button:has-text("Confirm")')
+                                        if dialog:
+                                            await dialog.click()
+                                            print("[Browser] Confirmed restart dialog")
+                                            break
+                                    except Exception:
+                                        pass
+                                    await page.wait_for_timeout(1000)
+                                await page.wait_for_timeout(25000)
+                                return True
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+
+            # Strategy 3: Look for ANY clickable element with × text in the top 60px
+            try:
+                all_clickable = await page.query_selector_all('button, [role="button"], [onclick], .btn')
+                for el in all_clickable:
+                    try:
+                        text = (await el.inner_text()).strip()
+                        box = await el.bounding_box()
+                        if text in ('×', '✕', '✗', 'X', 'x') and box and box['y'] < 60:
+                            await el.click()
+                            print(f"[Browser] Clicked × button (text='{text}') at ({box['x']:.0f},{box['y']:.0f})")
+                            await page.wait_for_timeout(5000)
+                            for _ in range(3):
+                                try:
+                                    dialog = await page.query_selector('button:has-text("Yes"), button:has-text("OK"), button:has-text("Confirm")')
+                                    if dialog:
+                                        await dialog.click()
+                                        print("[Browser] Confirmed restart dialog")
+                                        break
+                                except Exception:
+                                    pass
+                                await page.wait_for_timeout(1000)
+                            await page.wait_for_timeout(25000)
+                            return True
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+            # Strategy 4: Could not find × button — skip restart, just reset baseline
+            print("[Browser] Could not find × restart button — skipping restart (resetting log baseline)")
+            return False
+        except Exception as e:
+            print(f"[Browser] restart_game failed: {e}")
+            return False
+
+    async def _read_body_text(self):
+        """Read body text from the SX logs page using multiple strategies.
+        
+        Tries page.evaluate first (most robust — doesn't wait for visibility),
+        then falls back to inner_text (requires visible element).
+        Returns the text content or empty string on failure.
+        """
+        # Strategy 1: page.evaluate — directly executes JS, doesn't wait for visibility
+        try:
+            text = await self.logs_page.evaluate("() => document.body ? document.body.innerText : ''")
+            if text and text.strip():
+                return text
+        except Exception:
+            pass
+        
+        # Strategy 2: inner_text with short timeout (requires visible element)
+        try:
+            text = await self.logs_page.inner_text("body", timeout=3000)
+            if text and text.strip():
+                return text
+        except Exception:
+            pass
+        
+        # Strategy 3: text_content (doesn't require visibility, different from inner_text)
+        try:
+            text = await self.logs_page.text_content("body", timeout=3000)
+            if text and text.strip():
+                return text
+        except Exception:
+            pass
+        
+        return ""
+
+    async def _hard_reload_logs(self):
+        """Force a full page navigation instead of just a reload.
+        Used when the page is completely unresponsive.
+        """
+        if not self.logs_page:
+            return False
+        try:
+            url = self.logs_page.url
+            print(f"[Browser] Hard reload — navigating to {url}")
+            await self.logs_page.goto(url, wait_until="networkidle", timeout=20000)
+            await self.logs_page.wait_for_timeout(5000)
+            return True
+        except Exception as e:
+            print(f"[Browser] Hard reload failed: {e}")
+            return False
+
     async def read_logs(self):
         """Read the latest log text from the SX logs page.
 
         Returns the full text content of the logs area.
         Detects browser crashes and flags for restart.
+        Also detects stale dashboard state ("0 / 0 lines", "Connecting...",
+        "Waiting for logs…") and reloads the page to force a fresh WebSocket
+        connection.
         """
         if not self.logs_page:
             self._needs_restart = True
             return ""
         try:
             await self.logs_page.bring_to_front()
-            text = await self.logs_page.inner_text("body", timeout=5000)
+            text = await self._read_body_text()
+
+            # Detect stale dashboard state — the SX dashboard WebSocket can go
+            # stale, showing "0 / 0 lines" or "Connecting..." instead of
+            # actual encounter logs. Reload the page to reconnect.
+            text_lower = text.lower()
+            stale_markers = ["0 / 0 lines", "connecting...", "waiting for logs", "0/0 lines"]
+            if any(m in text_lower for m in stale_markers):
+                print("[Browser] SX logs page appears stale — reloading to reconnect WebSocket")
+                try:
+                    # Use networkidle instead of domcontentloaded — waits for the
+                    # Vue SPA to finish loading its JS bundle and WebSocket connection
+                    await self.logs_page.reload(wait_until="networkidle", timeout=20000)
+                    await self.logs_page.wait_for_timeout(5000)
+                    text = await self._read_body_text()
+                    text_lower2 = text.lower()
+                    if any(m in text_lower2 for m in stale_markers):
+                        print("[Browser] Logs page still stale after reload — trying hard reload")
+                        if await self._hard_reload_logs():
+                            text = await self._read_body_text()
+                            text_lower3 = text.lower()
+                            if any(m in text_lower3 for m in stale_markers):
+                                print("[Browser] Logs page still stale after hard reload")
+                            else:
+                                print("[Browser] Logs page reconnected via hard reload")
+                        else:
+                            print("[Browser] Hard reload failed — will retry next cycle")
+                    else:
+                        print("[Browser] Logs page reconnected successfully")
+                except Exception as reload_err:
+                    print(f"[Browser] Error reloading logs page: {reload_err}")
+                    # Last resort: try hard reload
+                    await self._hard_reload_logs()
+                    text = await self._read_body_text()
+
             return text
         except Exception as e:
             err_str = str(e).lower()
@@ -906,6 +1170,20 @@ class SXBrowser:
             else:
                 print(f"[Browser] Error reading logs: {e}")
             return ""
+
+    async def reload_logs_page(self):
+        """Reload the SX logs page to force a fresh WebSocket connection.
+        Called at the start of each monitoring cycle to ensure the page
+        is showing the latest logs."""
+        if not self.logs_page:
+            return
+        try:
+            await self.logs_page.reload(wait_until="networkidle", timeout=20000)
+            await self.logs_page.wait_for_timeout(3000)
+        except Exception as e:
+            print(f"[Browser] Error reloading logs page at cycle start: {e}")
+            # Fallback: try hard reload
+            await self._hard_reload_logs()
 
     async def snapshot_logs(self):
         """Take a snapshot of current log lines for baseline comparison."""
@@ -947,6 +1225,7 @@ class SXBrowser:
             "non_target_catches": [],
             "cluster_skip": False,
             "manual_skip": False,
+            "encounter_limit_reached": False,
         }
 
         poke_lower = pokemon_name.lower()
@@ -959,6 +1238,13 @@ class SXBrowser:
                 # Only look at lines that are NEW since the baseline
                 current_lines = set(text.splitlines())
                 new_lines = current_lines - baseline_lines
+
+                # Check for encounter limit reached
+                for line in new_lines:
+                    if "encounter limit reached" in line.lower():
+                        result["encounter_limit_reached"] = True
+                        print(f"[Browser] Encounter limit reached — bot should take a break")
+                        return result
 
                 # First pass: scan ALL new encounter lines for target, shinies, hundos
                 # This ensures we don't miss the target if it appears as the 4th+ encounter
@@ -974,45 +1260,58 @@ class SXBrowser:
                     enc_id_match = re.search(r'EncounterId:\s*(\d+)', line)
                     enc_id = enc_id_match.group(1) if enc_id_match else None
 
-                    # Check if it's the target
+                    # Check if it's the target (by species name or dex number)
                     is_target = poke_lower in line_lower
+                    if not is_target:
+                        poke_id = get_pokemon_id(pokemon_name)
+                        if poke_id and f'#{poke_id}' in line_lower:
+                            is_target = True
 
                     if is_target:
                         target_found_in_cluster = True
                         # Parse the target's IV and shiny status right here
+                        # Match by species name OR by dex number (handles "Pokemon#906" format)
+                        poke_id = get_pokemon_id(pokemon_name)
+                        target_enc_patterns = [re.escape(pokemon_name)]
+                        if poke_id:
+                            target_enc_patterns.append(rf'#{poke_id}\s*\(#{poke_id}\)')
+                        target_enc_pattern = '|'.join(f'(?:{p})' for p in target_enc_patterns)
                         target_enc_match = re.search(
-                            rf'{re.escape(pokemon_name)}.*?(\d+)cp.*?(\d+/\d+/\d+)\s*IV\s*\((\d+)%\)',
+                            rf'(?:{target_enc_pattern}).*?(\d+)cp.*?(\d+/\d+/\d+)\s*IV\s*\((\d+)%\)',
                             line, re.IGNORECASE
                         )
                         target_shiny = any(p.lower() in line_lower for p in shiny_patterns)
                         if target_enc_match:
-                            target_iv_pct = int(target_enc_match.group(3))
-                            result["cp"] = target_enc_match.group(1)
-                            result["iv"] = f"{target_enc_match.group(2)} IV ({target_enc_match.group(3)}%)"
-                            result["iv_percent"] = target_iv_pct
-                            result["found"] = True
-                            if enc_id:
-                                result["encounter_id"] = enc_id
-                            result["shiny"] = target_shiny or result.get("shiny", False)
-                            # Mark this encounter as processed so the second pass doesn't re-add it
-                            if enc_id and processed_encounter_ids is not None:
-                                processed_encounter_ids.add(enc_id)
-                            # Record the target encounter
-                            result["new_encounters"].append({
-                                "pokemon": pokemon_name,
-                                "cp": result["cp"],
-                                "iv": result["iv"],
-                                "iv_percent": target_iv_pct,
-                                "shiny": target_shiny,
-                                "encounter_id": enc_id,
-                            })
-                            # If hundo but not shiny — mark for skip, but DON'T return yet.
-                            # We need to finish scanning all lines in this batch so we don't
-                            # miss any shinies or other encounters that appeared at the same time.
-                            if skip_hundo_non_shiny and target_iv_pct == 100 and not target_shiny:
-                                if not result.get("skipped_hundo_non_shiny"):
-                                    result["skipped_hundo_non_shiny"] = True
-                                    print(f"[Browser] {pokemon_name} is 100% IV but NOT shiny — will skip after batch scan")
+                            try:
+                                target_iv_pct = int(target_enc_match.group(3))
+                                result["cp"] = target_enc_match.group(1)
+                                result["iv"] = f"{target_enc_match.group(2)} IV ({target_enc_match.group(3)}%)"
+                                result["iv_percent"] = target_iv_pct
+                                result["found"] = True
+                                if enc_id:
+                                    result["encounter_id"] = enc_id
+                                result["shiny"] = target_shiny or result.get("shiny", False)
+                                # Mark this encounter as processed so the second pass doesn't re-add it
+                                if enc_id and processed_encounter_ids is not None:
+                                    processed_encounter_ids.add(enc_id)
+                                # Record the target encounter
+                                result["new_encounters"].append({
+                                    "pokemon": pokemon_name,
+                                    "cp": result["cp"],
+                                    "iv": result["iv"],
+                                    "iv_percent": target_iv_pct,
+                                    "shiny": target_shiny,
+                                    "encounter_id": enc_id,
+                                })
+                                # If hundo but not shiny — mark for skip, but DON'T return yet.
+                                # We need to finish scanning all lines in this batch so we don't
+                                # miss any shinies or other encounters that appeared at the same time.
+                                if skip_hundo_non_shiny and target_iv_pct == 100 and not target_shiny:
+                                    if not result.get("skipped_hundo_non_shiny"):
+                                        result["skipped_hundo_non_shiny"] = True
+                                        print(f"[Browser] {pokemon_name} is 100% IV but NOT shiny — will skip after batch scan")
+                            except (TypeError, ValueError, IndexError) as e:
+                                print(f"[Browser] Error parsing target encounter IV: {e} (line: {line[:100]})")
                         # If we couldn't parse IV, fall through to second pass
                         continue
 
@@ -1023,16 +1322,26 @@ class SXBrowser:
                         non_target_encounter_ids.add(enc_id)
 
                     # Parse CP, IV, shiny from this non-target encounter
+                    # Handles both species-name format (e.g. "Panpour (#515)")
+                    # and dex-entry format (e.g. "Pokemon#906 (#906)")
                     enc_match = re.search(
-                        r'(\w[\w\s-]*?)\s*\(#\d+\)\s.*?(\d+)cp.*?(\d+/\d+/\d+)\s*IV\s*\((\d+)%\)',
+                        r'\(#(\d+)\)\s.*?(\d+)cp.*?(\d+/\d+/\d+)\s*IV\s*\((\d+)%\)',
                         line, re.IGNORECASE
                     )
                     nt_shiny = any(p.lower() in line_lower for p in shiny_patterns)
                     if enc_match or nt_shiny:
-                        nt_pokemon = enc_match.group(1).strip() if enc_match else "unknown"
-                        nt_cp = enc_match.group(2) if enc_match else None
-                        nt_iv = f"{enc_match.group(3)} IV ({enc_match.group(4)}%)" if enc_match else None
-                        nt_iv_pct = int(enc_match.group(4)) if enc_match else 0
+                        # Resolve species name from dex number
+                        if enc_match:
+                            nt_dex = int(enc_match.group(1))
+                            nt_pokemon = get_name_by_id(nt_dex) or f"pokemon#{nt_dex}"
+                            nt_cp = enc_match.group(2)
+                            nt_iv = f"{enc_match.group(3)} IV ({enc_match.group(4)}%)"
+                            nt_iv_pct = int(enc_match.group(4))
+                        else:
+                            nt_pokemon = "unknown"
+                            nt_cp = None
+                            nt_iv = None
+                            nt_iv_pct = 0
                         # Only log if shiny or hundo (to avoid cluttering stats)
                         if nt_shiny or nt_iv_pct == 100:
                             result["new_encounters"].append({
@@ -1060,6 +1369,10 @@ class SXBrowser:
                     # Skip if this is the target Pokemon (handled in second pass)
                     if poke_lower in line_lower:
                         continue
+                    # Also skip by dex number
+                    target_pid = get_pokemon_id(pokemon_name)
+                    if target_pid and f'#{target_pid}' in line_lower:
+                        continue
                     # Parse the caught Pokemon name
                     catch_match = re.search(
                         r'Caught.*?Pokemon\s+(.+?)\s+\(#(\d+)\)',
@@ -1067,8 +1380,9 @@ class SXBrowser:
                     )
                     if not catch_match:
                         continue
-                    nt_catch_name = catch_match.group(1).strip()
-                    nt_catch_num = catch_match.group(2)
+                    nt_catch_num = int(catch_match.group(2))
+                    # Resolve species name from dex number (handles "Pokemon#906" format)
+                    nt_catch_name = get_name_by_id(nt_catch_num) or catch_match.group(1).strip()
                     # Try to find the encounter line for this Pokemon to get CP/IV
                     nt_cp = None
                     nt_iv = None
@@ -1108,8 +1422,11 @@ class SXBrowser:
                 # Second pass: process target encounters (catch/fled/shiny/skip logic)
                 for line in new_lines:
                     line_lower = line.lower()
+                    # Check for species name OR dex number (handles "Pokemon#906" format)
+                    poke_id = get_pokemon_id(pokemon_name)
                     if poke_lower not in line_lower:
-                        continue
+                        if not (poke_id and f'#{poke_id}' in line_lower):
+                            continue
 
                     # Parse EncounterId for deduplication
                     enc_id_match = re.search(r'EncounterId:\s*(\d+)', line)
@@ -1130,8 +1447,14 @@ class SXBrowser:
 
                     # Try to extract CP, IV, and IV percentage
                     # Matches: "Pokemon Fennekin (#653) — 499cp, 15/15/15 IV (100%)"
+                    # Also handles dex-entry format: "Pokemon#906 (#906) — 942cp, ..."
+                    poke_id = get_pokemon_id(pokemon_name)
+                    target_enc_patterns = [re.escape(pokemon_name)]
+                    if poke_id:
+                        target_enc_patterns.append(rf'#{poke_id}\s*\(#{poke_id}\)')
+                    target_enc_pattern = '|'.join(f'(?:{p})' for p in target_enc_patterns)
                     encounter_match = re.search(
-                        rf'{re.escape(pokemon_name)}.*?(\d+)cp.*?(\d+/\d+/\d+)\s*IV\s*\((\d+)%\)',
+                        rf'(?:{target_enc_pattern}).*?(\d+)cp.*?(\d+/\d+/\d+)\s*IV\s*\((\d+)%\)',
                         line, re.IGNORECASE
                     )
                     if encounter_match:
@@ -1206,6 +1529,10 @@ class SXBrowser:
                     pass
 
         print(f"[Browser] Log monitoring timed out ({timeout}s). Result: {result}")
+        # Final check for encounter limit in the last read
+        if text and "encounter limit reached" in text.lower():
+            result["encounter_limit_reached"] = True
+            print(f"[Browser] Encounter limit reached — bot should take a break")
         return result
 
     async def close(self):

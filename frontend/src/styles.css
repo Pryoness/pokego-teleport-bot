@@ -1,0 +1,108 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", "SF Mono", ui-monospace, monospace;
+
+  --color-bg: #09090b;
+  --color-surface: #121418;
+  --color-elevated: #181c22;
+  --color-fg: #ecece8;
+  --color-muted: #8b919a;
+  --color-subtle: #5c636c;
+  --color-accent: #9eb0c0;
+  --color-accent-fg: #0c1014;
+  --color-border: color-mix(in oklab, #ecece8 12%, transparent);
+  --color-border-strong: color-mix(in oklab, #ecece8 22%, transparent);
+  --color-success: #7ea88a;
+  --color-danger: #c07070;
+  --color-warn: #c4a574;
+
+  --radius-xs: 4px;
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 24px;
+
+  --shadow-border: 0 0 0 1px color-mix(in oklab, #ecece8 8%, transparent);
+}
+
+@layer base {
+  html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+  html,
+  body,
+  #app {
+    min-height: 100%;
+    background: var(--color-bg);
+    color: var(--color-fg);
+  }
+  body {
+    font-family: var(--font-sans);
+  }
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+  h1,
+  h2,
+  h3 {
+    text-wrap: balance;
+  }
+  p {
+    text-wrap: pretty;
+  }
+}
+
+@layer utilities {
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Leaflet overrides to match the ops room */
+.leaflet-container {
+  background: #0c1014;
+  font-family: var(--font-sans);
+}
+.leaflet-control-zoom a {
+  background: #181c22 !important;
+  color: #ecece8 !important;
+  border-color: color-mix(in oklab, #ecece8 14%, transparent) !important;
+}
+.leaflet-bar {
+  border: none !important;
+  box-shadow: 0 0 0 1px color-mix(in oklab, #ecece8 12%, transparent) !important;
+}
+.leaflet-popup-content-wrapper,
+.leaflet-popup-tip {
+  background: #181c22;
+  color: #ecece8;
+  box-shadow: none;
+  border: 1px solid color-mix(in oklab, #ecece8 14%, transparent);
+}
+.leaflet-popup-content {
+  margin: 10px 12px;
+  font-size: 12px;
+  line-height: 1.45;
+}
+.leaflet-control-attribution {
+  background: color-mix(in oklab, #09090b 80%, transparent) !important;
+  color: #5c636c !important;
+  font-size: 10px !important;
+}
+.leaflet-control-attribution a {
+  color: #8b919a !important;
+}

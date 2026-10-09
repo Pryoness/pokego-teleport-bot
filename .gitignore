@@ -1,0 +1,16 @@
+# Runtime data & secrets — never commit
+dedup_ids.json
+stats.json
+channel_stats.json
+pokemon_cache.json
+browser_profile/
+terminal.log*
+login_flow.log
+venv/
+__pycache__/
+__MACOSX/
+frontend/node_modules/
+frontend/dist/
+frontend/.project_id
+*.env
+.env*

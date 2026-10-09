@@ -6,12 +6,17 @@ import re
 import shlex
 import time
 import random
+import json
+import os
 
 from config import config
 from stats import stats, haversine_km
 from queue_manager import queue
 from browser import SXBrowser
 from pokemon_data import is_valid_pokemon, get_sprite_url
+
+# Path for channel success rate log
+CHANNEL_STATS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "channel_stats.json")
 
 
 def display_name(name):
@@ -32,9 +37,23 @@ class PokeBot:
         self.current_activity = "Idle"
         self.loop_step = 0  # 0=idle, 1=watching, 2=extracting, 3=teleport, 4=walk, 5=monitor, 6=cooldown
         self.current_coords = None  # Current target coordinates for cooldown display
+        # Initialize from last known catch coords (survives restarts)
+        _last_cc = stats._data.get("last_catch_coords")
+        if _last_cc:
+            self.current_coords = f"{_last_cc['lat']},{_last_cc['lng']}"
         self._coord_response_future = None  # Future for receiving coord responses from button clicks
         self._reveal_coords_lock = asyncio.Lock()  # Serialize Reveal Coords clicks to prevent race conditions
         self._recent_coords = {}  # coords_str -> expiry timestamp, prevents re-teleporting to same location
+        self._last_message_time = time.time()  # Track last Discord message for staleness detection
+        self._bg_scanner_task = None  # Background log scanner
+        self._bg_baseline_lines = set()  # Baseline for background scanner
+        self._bg_scanned_encounter_ids = set()  # Dedup for background scanner
+        self._queue_refilled = set()  # Pokemon names that have hit queue cap; only refill when empty
+        self._channel_stats = {}  # channel_id -> {found, no_result, caught, fled, skipped, total}
+        self._last_encounter_coords = None  # Coords from last BgScanner hundo encounter for catch cooldown
+        self._consecutive_no_spawn = 0  # Counter for consecutive no-spawn teleports
+        self._last_sx_restart_time = 0  # Timestamp of last SX game restart
+        self._load_channel_stats()
         self._setup_events()
 
     async def _send(self, channel, message):
@@ -61,6 +80,7 @@ class PokeBot:
         @client.event
         async def on_ready():
             print(f"[Discord] Logged in as {client.user} (ID: {client.user.id})")
+            self._last_message_time = time.time()
             if self.browser is not None:
                 print("[Discord] Reconnected; browser already running.")
                 return
@@ -69,9 +89,22 @@ class PokeBot:
             await self.browser.start()
             print("[Discord] Browser ready!")
             self._print_banner()
+            # Auto-start background log scanner for passive hundo/shiny tracking
+            if self._bg_scanner_task is None or self._bg_scanner_task.done():
+                self._bg_scanner_task = asyncio.create_task(self._background_log_scanner())
+
+        @client.event
+        async def on_disconnect():
+            print("[Discord] Connection lost! Attempting reconnection...")
+
+        @client.event
+        async def on_resumed():
+            print("[Discord] Connection resumed.")
+            self._last_message_time = time.time()
 
         @client.event
         async def on_message(message):
+            self._last_message_time = time.time()
             await self._on_message(message)
 
     def _print_banner(self):
@@ -89,6 +122,7 @@ class PokeBot:
         print("    @bot clear queue                Clear the queue")
         print("    @bot stats                      Show statistics")
         print("    @bot caught                     Show caught Pokemon")
+        print("    @bot channels                   Show per-channel success rates")
         print("    @bot start                      Start monitoring")
         print("    @bot stop                       Stop monitoring")
         print("    @bot status                     Show current status")
@@ -165,6 +199,7 @@ class PokeBot:
                 if parts and parts[0].lower() in (
                     "add", "remove", "targets", "queue", "clear", "stats",
                     "caught", "start", "stop", "status", "set", "help", "priority",
+                    "channels",
                 ):
                     await self._handle_command(message, parts)
                     return
@@ -172,6 +207,47 @@ class PokeBot:
         # If running and in the watch channel, check for target Pokemon keywords
         if self.running and is_watch_channel:
             await self._check_for_targets(message)
+
+    def _load_channel_stats(self):
+        """Load per-channel success rate stats from disk."""
+        try:
+            if os.path.exists(CHANNEL_STATS_PATH):
+                with open(CHANNEL_STATS_PATH, "r") as f:
+                    self._channel_stats = json.load(f)
+        except Exception as e:
+            print(f"[ChannelStats] Error loading: {e}")
+            self._channel_stats = {}
+
+    def _save_channel_stats(self):
+        """Save per-channel success rate stats to disk."""
+        try:
+            with open(CHANNEL_STATS_PATH, "w") as f:
+                json.dump(self._channel_stats, f, indent=2)
+        except Exception as e:
+            print(f"[ChannelStats] Error saving: {e}")
+
+    def _record_channel_result(self, channel_id, result):
+        """Record a monitoring result for a channel."""
+        ch_key = str(channel_id) if channel_id else "unknown"
+        if ch_key not in self._channel_stats:
+            self._channel_stats[ch_key] = {"found": 0, "no_result": 0, "caught": 0, "fled": 0, "skipped": 0, "total": 0}
+        if result in self._channel_stats[ch_key]:
+            self._channel_stats[ch_key][result] += 1
+        self._channel_stats[ch_key]["total"] += 1
+        self._save_channel_stats()
+
+    def _purge_expired_tasks(self):
+        """Remove expired tasks from the queue. Call before selecting a task."""
+        all_tasks = queue.peek_all()
+        purged = 0
+        for task in all_tasks:
+            if task.is_expired:
+                stats.record_expired(task.pokemon)
+                queue.mark_done(task)
+                purged += 1
+        if purged:
+            print(f"[Worker] Purged {purged} expired task(s) from queue")
+        return purged
 
     async def _handle_command(self, message, parts):
         """Parse and execute a Discord command."""
@@ -190,6 +266,7 @@ class PokeBot:
                 "`@bot clear queue` - Clear the queue\n"
                 "`@bot stats` - Show statistics\n"
                 "`@bot caught` - Show caught Pokemon\n"
+                "`@bot channels` - Show per-channel success rates\n"
                 "`@bot start` - Start monitoring\n"
                 "`@bot stop` - Stop monitoring\n"
                 "`@bot status` - Show current status\n"
@@ -334,6 +411,9 @@ class PokeBot:
                 stats.record_start()
                 if self.worker_task is None or self.worker_task.done():
                     self.worker_task = asyncio.create_task(self._worker_loop())
+                # Start background log scanner for passive hundo/shiny tracking
+                if self._bg_scanner_task is None or self._bg_scanner_task.done():
+                    self._bg_scanner_task = asyncio.create_task(self._background_log_scanner())
                 targets = config.get_targets()
                 await self._send(message.channel, 
                     f"Started monitoring channel `{config.get('watch_channel_id')}` "
@@ -380,6 +460,29 @@ class PokeBot:
                     await self._send(message.channel, "Usage: `@bot priority <pokemon> high/low`")
             else:
                 await self._send(message.channel, "Usage: `@bot priority <pokemon> high/low`")
+
+        elif cmd == "channels":
+            """Show per-channel encounter success rates."""
+            if not self._channel_stats:
+                await self._send(message.channel, "No channel stats recorded yet.")
+            else:
+                lines = ["**Channel Success Rates:**"]
+                for ch_id, data in sorted(self._channel_stats.items(), key=lambda x: -x[1].get("total", 0)):
+                    total = data.get("total", 0)
+                    if total == 0:
+                        continue
+                    found = data.get("found", 0)
+                    caught = data.get("caught", 0)
+                    fled = data.get("fled", 0)
+                    no_result = data.get("no_result", 0)
+                    skipped = data.get("skipped", 0)
+                    found_pct = (found + caught) / total * 100 if total else 0
+                    lines.append(
+                        f"Channel `{ch_id}`: {total} attempts | "
+                        f"Found: {found + caught} ({found_pct:.0f}%) | "
+                        f"No result: {no_result} | Fled: {fled} | Skipped: {skipped}"
+                    )
+                await self._send(message.channel, "\n".join(lines))
 
     async def _handle_set(self, message, args):
         """Handle the 'set' command for updating settings."""
@@ -735,7 +838,28 @@ class PokeBot:
         # Check each target Pokemon — only match in title/content, not PvP fields
         for pokemon in targets:
             if pokemon.lower() in name_lower:
+                # Solo mode: if any Pokémon has solo enabled, only extract coords for those
+                solo_names = config.get("target_only_pokemon", [])
+                if solo_names and pokemon.lower() not in solo_names:
+                    continue  # Skip — not the solo target, don't click anything
+
+                # Queue cap check: don't click coords if we already have enough of this Pokemon
+                queue_limit = config.get("queue_limit_per_pokemon", 5)
+                current_count = queue.get_pokemon_count(pokemon)
+                pkmn_lower = pokemon.lower()
+
+                if current_count >= queue_limit:
+                    # Mark as refilled — won't click again until queue empties to 0
+                    self._queue_refilled.add(pkmn_lower)
+                    continue
+                # If we previously filled the queue, only click again once it's fully empty
+                if pkmn_lower in self._queue_refilled and current_count > 0:
+                    continue
+                # Queue is empty — clear the refilled flag and allow filling again
+                self._queue_refilled.discard(pkmn_lower)
+
                 # Found a target! Try "Reveal Coords" button first, then fall back to URL extraction
+                print(f"[Monitor] Need coords for {pokemon} ({current_count}/{queue_limit}); extracting")
                 coords = await self._click_reveal_coords(message)
                 coord_url = ""
                 all_urls = []
@@ -772,14 +896,8 @@ class PokeBot:
                 # after encountering the Pokemon in-game
                 iv_info = self._parse_iv_from_message(full_text)
 
-                # Solo mode: if any Pokémon has solo enabled, only queue those
-                solo_names = config.get("target_only_pokemon", [])
-                if solo_names and pokemon.lower() not in solo_names:
-                    continue  # Skip — not the solo target
-
                 # Add to queue with per-Pokemon limit
                 priority = 0 if config.is_high_priority(pokemon) else 1
-                queue_limit = config.get("queue_limit_per_pokemon", 5)
                 added = queue.add(
                     pokemon=pokemon,
                     url=coord_url,
@@ -858,6 +976,199 @@ class PokeBot:
         if not target:
             return None
         return haversine_km(last["lat"], last["lng"], target[0], target[1])
+
+    async def _background_log_scanner(self):
+        """Background task that scans game logs for hundos/shinies/catches
+        even when the bot is idle (no targets in queue).
+
+        This ensures encounters are always tracked, not just during active monitoring.
+        Runs every 15 seconds, independent of the main worker loop."""
+        from pokemon_data import get_name_by_id
+
+        print("[BgScanner] Background log scanner started")
+        # Initialize baseline with current log contents
+        try:
+            if self.browser:
+                text = await self.browser.read_logs()
+                if text:
+                    self._bg_baseline_lines = set(text.splitlines())
+        except Exception as e:
+            print(f"[BgScanner] Error initializing baseline: {e}")
+
+        while True:
+            try:
+                await asyncio.sleep(15)
+                if not self.browser:
+                    continue
+
+                text = await self.browser.read_logs()
+                if not text:
+                    continue
+
+                current_lines = set(text.splitlines())
+                new_lines = current_lines - self._bg_baseline_lines
+                self._bg_baseline_lines = current_lines
+
+                if not new_lines:
+                    continue
+
+                # Parse encounter lines for hundos and shinies
+                for line in new_lines:
+                    line_lower = line.lower()
+
+                    # Only process encounter or catch lines
+                    if "[normalencounter]" not in line_lower and "normal-encounter" not in line_lower:
+                        # Also check for catch lines
+                        if "[catchpokemon]" not in line_lower and "caught" not in line_lower:
+                            continue
+
+                    # Check for CATCH lines FIRST — catch lines contain "Normal-Encounter"
+                    # so they'd match the encounter check below, but the encounter regex
+                    # would fail (no CP/IV data) and skip the catch detection via continue.
+                    # Parse catch lines for cooldown tracking
+                    if ("[catchpokemon]" in line_lower or ("caught" in line_lower and "pokemon" in line_lower)):
+                        catch_match = re.search(
+                            r'Caught.*?Pokemon\s+(.+?)\s+\(#(\d+)\)',
+                            line, re.IGNORECASE
+                        )
+                        if catch_match:
+                            dex_num = int(catch_match.group(2))
+                            caught_name = get_name_by_id(dex_num) or catch_match.group(1).strip()
+                            # Try to find the matching encounter line for CP/IV/EncounterId
+                            nt_cp = None
+                            nt_iv = None
+                            nt_iv_pct = 0
+                            nt_shiny = False
+                            nt_enc_id = None
+                            for enc_line in new_lines:
+                                enc_lower = enc_line.lower()
+                                if caught_name.lower() not in enc_lower:
+                                    continue
+                                # Must be an encounter line with EncounterId (not a catch line)
+                                if "encounterid:" not in enc_lower:
+                                    continue
+                                if "[normalencounter]" not in enc_lower and "normal-encounter" not in enc_lower:
+                                    continue
+                                enc_match = re.search(
+                                    rf'{re.escape(caught_name)}.*?(\d+)cp.*?(\d+/\d+/\d+)\s*IV\s*\((\d+)%\)',
+                                    enc_line, re.IGNORECASE
+                                )
+                                if enc_match:
+                                    nt_cp = enc_match.group(1)
+                                    nt_iv = f"{enc_match.group(2)} IV ({enc_match.group(3)}%)"
+                                    nt_iv_pct = int(enc_match.group(3))
+                                nt_shiny = any(p.lower() in enc_lower for p in config.get("shiny_log_patterns", []))
+                                enc_id_match = re.search(r'EncounterId:\s*(\d+)', enc_line)
+                                if enc_id_match:
+                                    nt_enc_id = enc_id_match.group(1)
+                                break
+                            # Use current coords if available, then fall back to last encounter coords,
+                            # then last known catch coords from stats
+                            coords = self.current_coords or self._last_encounter_coords
+                            if not coords:
+                                last_coords = stats._data.get("last_catch_coords")
+                                if last_coords:
+                                    coords = f"{last_coords['lat']},{last_coords['lng']}"
+                            stats.record_caught(
+                                caught_name,
+                                cp=nt_cp,
+                                iv=nt_iv,
+                                shiny=nt_shiny,
+                                iv_percent=nt_iv_pct,
+                                encounter_id=nt_enc_id,
+                                coords=coords,
+                                is_target=False,
+                            )
+                            # Start visible cooldown on dashboard (2hr max from distance chart)
+                            # This is display-only; worker uses per-target distance cooldowns.
+                            stats.start_cooldown(7200)
+                            # Remove caught Pokemon from queue and targets if applicable
+                            try:
+                                purged = queue.remove_pokemon(caught_name)
+                                if purged:
+                                    print(f"[BgScanner] Removed {purged} queued {caught_name} (caught by SX CatchRules)")
+                                # If caught Pokemon is a hundo/shundo and in target list, remove from targets
+                                is_hundo_or_shundo = nt_iv_pct == 100 or (nt_shiny and nt_iv_pct == 100)
+                                if is_hundo_or_shundo and caught_name.lower() in [t.lower() for t in config.get_targets()]:
+                                    if config.get("auto_remove_caught", True):
+                                        if config.get("remove_evolution_line", False):
+                                            self._remove_evolution_line(caught_name, queue)
+                                        else:
+                                            config.remove_target(caught_name)
+                                        print(f"[BgScanner] Auto-removed {caught_name} from targets (caught)")
+                            except Exception as e:
+                                print(f"[BgScanner] Error removing caught target: {e}")
+                            print(f"[BgScanner] Catch detected: {caught_name} (cp={nt_cp}, iv={nt_iv}, shiny={nt_shiny}, coords={coords}) — cooldown started")
+                        continue  # Don't also process as encounter
+
+                    # Parse encounter line for hundo/shiny
+                    if "normal-encounter" in line_lower or "[normalencounter]" in line_lower:
+                        # Dedup by encounter ID
+                        enc_id_match = re.search(r'EncounterId:\s*(\d+)', line)
+                        enc_id = enc_id_match.group(1) if enc_id_match else None
+                        if enc_id and enc_id in self._bg_scanned_encounter_ids:
+                            continue
+                        if enc_id:
+                            self._bg_scanned_encounter_ids.add(enc_id)
+                            # Keep set bounded
+                            if len(self._bg_scanned_encounter_ids) > 500:
+                                self._bg_scanned_encounter_ids = set(list(self._bg_scanned_encounter_ids)[-250:])
+
+                        # Parse dex number and IV
+                        enc_match = re.search(
+                            r'\(#(\d+)\)\s.*?(\d+)cp.*?(\d+/\d+/\d+)\s*IV\s*\((\d+)%\)',
+                            line, re.IGNORECASE
+                        )
+                        if not enc_match:
+                            continue
+
+                        dex_num = int(enc_match.group(1))
+                        pokemon_name = get_name_by_id(dex_num) or f"pokemon#{dex_num}"
+                        cp = enc_match.group(2)
+                        iv_str = f"{enc_match.group(3)} IV ({enc_match.group(4)}%)"
+                        iv_pct = int(enc_match.group(4))
+
+                        # Check for shiny indicators
+                        shiny_patterns = config.get("shiny_log_patterns", [])
+                        is_shiny = any(p.lower() in line_lower for p in shiny_patterns)
+
+                        # Only log hundos and shinies
+                        if iv_pct == 100 or is_shiny:
+                            # Store encounter coords for catch cooldown tracking
+                            if self.current_coords:
+                                self._last_encounter_coords = self.current_coords
+                            stats.record_encounter(
+                                pokemon_name,
+                                cp=cp,
+                                iv=iv_str,
+                                shiny=is_shiny,
+                                iv_percent=iv_pct,
+                                encounter_id=enc_id,
+                                is_target=False,
+                            )
+                            if iv_pct == 100 and is_shiny:
+                                print(f"[BgScanner] SHUNDO: {pokemon_name} — {cp}cp, {iv_str}")
+                                # Send DM notification for shundo
+                                notify_id = config.get("notify_user_id")
+                                if notify_id:
+                                    try:
+                                        user = await self.client.fetch_user(int(notify_id))
+                                        if user:
+                                            await self._dm(user, f"SHUNDO FOUND! {display_name(pokemon_name)} — {cp}cp, {iv_str}")
+                                            print(f"[BgScanner] Notified user about shundo {pokemon_name}")
+                                    except Exception as e:
+                                        print(f"[BgScanner] Failed to send shundo DM: {e}")
+                            elif iv_pct == 100:
+                                print(f"[BgScanner] Hundo: {pokemon_name} — {cp}cp, {iv_str}")
+                            elif is_shiny:
+                                print(f"[BgScanner] Shiny: {pokemon_name} — {cp}cp, {iv_str}")
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print(f"[BgScanner] Error: {e}")
+
+        print("[BgScanner] Background log scanner stopped")
 
     async def _select_best_task(self):
         """Select the best task from the queue using proximity-based ordering.
@@ -994,10 +1305,98 @@ class PokeBot:
 
         return task, coords
 
+    async def _backfill_queue_from_channels(self):
+        """Fetch recent messages from watch channels and process them for targets.
+        Called when the queue has been empty for a while to catch messages
+        that were missed during processing or restarts.
+        
+        Runs as a background task so it doesn't block the worker loop.
+        The worker can process targets as they're added to the queue.
+        """
+        if getattr(self, '_backfill_running', False):
+            print("[Worker] Backfill already in progress — skipping")
+            return
+        self._backfill_running = True
+        try:
+            await self._do_backfill()
+        finally:
+            self._backfill_running = False
+
+    async def _do_backfill(self):
+        """Actual backfill logic — processes messages from watch channels."""
+        watch_channel_id = config.get("watch_channel_id")
+        additional_channels = config.get("additional_watch_channels", [])
+        channel_ids = set()
+        if watch_channel_id:
+            channel_ids.add(str(watch_channel_id))
+        for ch in additional_channels:
+            channel_ids.add(str(ch))
+        
+        if not channel_ids:
+            return
+        
+        # Track processed message IDs to avoid double-processing
+        if not hasattr(self, '_backfilled_msg_ids'):
+            self._backfilled_msg_ids = set()
+        
+        total_found = 0
+        targets_queued = 0
+        backfill_start = time.time()
+        max_backfill_seconds = 60  # Don't run for more than 1 minute
+        
+        for ch_id in channel_ids:
+            # Stop if we've been running too long
+            if time.time() - backfill_start > max_backfill_seconds:
+                print(f"[Worker] Backfill time limit ({max_backfill_seconds}s) reached — stopping")
+                break
+            try:
+                channel = self.client.get_channel(int(ch_id))
+                if not channel:
+                    continue
+                # Fetch last 15 messages from each channel
+                async for message in channel.history(limit=15):
+                    # Stop if we've been running too long
+                    if time.time() - backfill_start > max_backfill_seconds:
+                        break
+                    # Skip already-processed messages
+                    if message.id in self._backfilled_msg_ids:
+                        continue
+                    self._backfilled_msg_ids.add(message.id)
+                    # Keep the set bounded
+                    if len(self._backfilled_msg_ids) > 500:
+                        self._backfilled_msg_ids = set(list(self._backfilled_msg_ids)[-250:])
+                    # Process through the same target checker
+                    was_running = self.running
+                    self.running = True
+                    try:
+                        queue_before = queue.size()
+                        await self._check_for_targets(message)
+                        queue_after = queue.size()
+                        if queue_after > queue_before:
+                            targets_queued += (queue_after - queue_before)
+                    finally:
+                        self.running = was_running
+                    total_found += 1
+            except Exception as e:
+                print(f"[Worker] Error backfilling from channel {ch_id}: {e}")
+        
+        # Keep the backfilled IDs set from growing unbounded
+        if len(self._backfilled_msg_ids) > 500:
+            self._backfilled_msg_ids = set(list(self._backfilled_msg_ids)[-250:])
+        
+        elapsed = int(time.time() - backfill_start)
+        if targets_queued > 0:
+            print(f"[Worker] Channel backfill: scanned {total_found} messages in {elapsed}s, queued {targets_queued} target(s)")
+        else:
+            print(f"[Worker] Channel backfill: scanned {total_found} messages in {elapsed}s, no targets found")
+
     async def _worker_loop(self):
         """Background worker that processes the queue: teleport, walk, monitor logs."""
         print(f"[Worker] Started (running={self.running})")
         heartbeat_counter = 0
+        idle_since = None  # Track when the queue first went empty
+        backfill_interval = 300  # Backfill every 5 minutes when idle
+        last_backfill = 0
         while self.running:
             # Check if paused
             if self.paused:
@@ -1011,20 +1410,65 @@ class PokeBot:
                 expired = queue.cleanup_expired()
                 for exp_task in expired:
                     print(f"[Worker] Expired: {exp_task.pokemon}")
-                    stats.record_expired(exp_task.pokemon)
+                    stats.record_expired(exp_task)
 
+                # Cleanup targets below min DSP — remove before they're selected
+                min_dsp = config.get("min_dsp_seconds", 120)
+                below_dsp = queue.cleanup_below_dsp(min_dsp)
+                for bd_task in below_dsp:
+                    print(f"[Worker] Removed {bd_task.pokemon} from queue — DSP {bd_task.remaining_minutes}m below min ({min_dsp}s)")
+                    stats.record_expired(bd_task.pokemon)
+
+                # Purge expired tasks before selecting
+                self._purge_expired_tasks()
                 # Select best task using proximity-based ordering
                 # This handles cooldown checking and picks the nearest catchable target
                 task, coords = await self._select_best_task()
                 if task is None:
+                    # Track when we first went idle
+                    if idle_since is None:
+                        idle_since = time.time()
+                    idle_secs = int(time.time() - idle_since)
+                    
                     self.current_activity = "Waiting for targets in channel…"
                     self.loop_step = 1
                     # Heartbeat every 30 seconds so we know the bot is alive
                     heartbeat_counter += 1
                     if heartbeat_counter % 30 == 0:
-                        print(f"[Worker] Heartbeat — watching for targets… ({heartbeat_counter}s)")
+                        stale_secs = int(time.time() - self._last_message_time)
+                        stale_mins = stale_secs // 60
+                        target_count = len(config.get_targets())
+                        print(f"[Worker] Heartbeat — watching for targets… ({heartbeat_counter}s, last message {stale_mins}m ago, {target_count} targets in list)")
+                        # Watchdog: if no Discord messages for 5+ minutes, the connection may have dropped
+                        if stale_secs > 300:
+                            print(f"[Worker] WARNING: No Discord messages for {stale_mins} minutes — connection may be dead")
+                            # Check if the Discord client is still connected
+                            if not self.client.is_ready():
+                                print("[Worker] Discord client disconnected — attempting manual reconnect…")
+                                try:
+                                    await self.client.close()
+                                    await asyncio.sleep(2)
+                                    await self.client.login(config.get("discord_token"))
+                                    await self.client.connect()
+                                    print("[Worker] Discord reconnection attempt completed")
+                                except Exception as e:
+                                    print(f"[Worker] Discord reconnection failed: {e}")
+                            self._last_message_time = time.time()  # Reset to avoid spamming reconnect attempts
+                        
+                        # Channel backfill: if idle for 5+ minutes, scan recent channel messages
+                        # for missed targets (messages posted while bot was busy or restarting)
+                        if idle_secs >= backfill_interval and (time.time() - last_backfill) >= backfill_interval:
+                            print(f"[Worker] Queue empty for {idle_secs//60}m — backfilling from recent channel messages…")
+                            last_backfill = time.time()
+                            # Run backfill as a background task so the worker loop
+                            # can process targets as they're added to the queue
+                            asyncio.create_task(self._backfill_queue_from_channels())
                     await asyncio.sleep(1)
                     continue
+
+                # We have a task — reset idle tracking
+                idle_since = None
+                heartbeat_counter = 0
 
                 self.current_coords = coords
                 self.current_activity = f"Processing {task.pokemon} (DSP: {task.remaining_minutes}m)"
@@ -1131,6 +1575,10 @@ class PokeBot:
                 # during teleport/walk must be detected as new lines during monitoring.
                 self.current_activity = f"Reading coordinates for {display_name(task.pokemon)}…"
                 self.loop_step = 2
+                # Reload the logs page to force a fresh WebSocket connection.
+                # The SX dashboard WebSocket can go stale between monitoring cycles,
+                # causing the page to stop receiving new encounter logs.
+                await self.browser.reload_logs_page()
                 baseline_logs = await self.browser.snapshot_logs()
 
                 # Teleport
@@ -1194,6 +1642,70 @@ class PokeBot:
                 # Log monitoring result
                 mon_status = "caught" if result["caught"] else ("fled" if result["fled"] else ("skipped_hundo" if result.get("skipped_hundo_non_shiny") else ("cluster_skip" if result.get("cluster_skip") else ("found" if result["found"] else "no_result"))))
                 print(f"[Worker] Monitoring result for {task.pokemon}: {mon_status}")
+                self._record_channel_result(task.channel_id, mon_status)
+
+                # Check for encounter limit — start a 10-minute cooldown.
+                # During cooldown: don't teleport to new targets, but keep the
+                # logs page fresh so BgScanner can still record encounters that
+                # appear as old ones expire and free up encounter slots.
+                if result.get("encounter_limit_reached"):
+                    print("[Worker] Encounter limit reached — starting 10-min cooldown (tracking continues)")
+                    stats.add_event("system", "Encounter limit reached — 10min cooldown")
+                    self._consecutive_no_spawn = 0
+                    break_seconds = 600  # 10 minutes
+                    for remaining in range(break_seconds, 0, -15):
+                        self.current_activity = f"Encounter limit cooldown — {remaining}s remaining…"
+                        self.loop_step = 0
+                        # Reload logs page to keep WebSocket fresh — encounters
+                        # may still appear as expired ones free up slots
+                        try:
+                            await self.browser.reload_logs_page()
+                        except Exception:
+                            pass
+                        await asyncio.sleep(15)
+                    print("[Worker] Encounter limit cooldown over — resuming")
+                    continue
+
+                # Track consecutive no-spawn teleports for auto-restart
+                # Only count as no-spawn if NO encounters happened at all (game frozen)
+                no_spawn = (
+                    mon_status == "no_result"
+                    and not result.get("new_encounters")
+                    and not result.get("non_target_catches")
+                    and not result.get("cluster_skip")
+                    and not result.get("manual_skip")
+                )
+                # Don't count no-spawn teleports for 3 minutes after a restart
+                # — the game needs time to stabilize and start spawning
+                restart_cooldown = 180  # 3 minutes
+                time_since_restart = asyncio.get_event_loop().time() - self._last_sx_restart_time
+                if time_since_restart < restart_cooldown:
+                    if no_spawn:
+                        print(f"[Worker] No-spawn (restart cooldown: {int(restart_cooldown - time_since_restart)}s remaining)")
+                    # Reset streak during cooldown to prevent restart loops
+                    self._consecutive_no_spawn = 0
+                elif no_spawn:
+                    self._consecutive_no_spawn += 1
+                    print(f"[Worker] No-spawn streak: {self._consecutive_no_spawn}/5")
+                else:
+                    self._consecutive_no_spawn = 0
+
+                # Auto-restart SX game after 5 consecutive no-spawn teleports
+                if self._consecutive_no_spawn >= 5:
+                    print("[Worker] 5 no-spawn teleports — restarting SX game")
+                    stats.add_event("system", "Auto-restarting SX game after 5 no-spawn teleports")
+                    self._consecutive_no_spawn = 0
+                    self._last_sx_restart_time = asyncio.get_event_loop().time()
+                    try:
+                        ok = await self.browser.restart_game()
+                        if ok:
+                            print("[Browser] SX game restarted successfully")
+                        else:
+                            print("[Browser] SX game restart failed")
+                    except Exception as restart_err:
+                        print(f"[Browser] SX restart error: {restart_err}")
+                    self._bg_baseline_lines = set()
+                    await asyncio.sleep(60)  # Wait for game to stabilize after restart
 
                 # Process result
                 # First, handle any non-target catches (wild hundos/shundos that were caught)
@@ -1212,6 +1724,9 @@ class PokeBot:
                         coords=coords,
                         is_target=False,
                     )
+                    # Start visible cooldown on dashboard (2hr max from distance chart)
+                    stats.start_cooldown(7200)
+                    print(f"[Worker] Non-target catch cooldown started (2h)")
                     # Notify if it's a shundo
                     if nt_shiny and nt_iv_pct == 100:
                         notify_id = config.get("notify_user_id")
@@ -1310,7 +1825,8 @@ class PokeBot:
                             except Exception as e:
                                 print(f"[Worker] Failed to send shundo DM: {e}")
                     # Cooldown is now per-target (distance from last catch)
-                    # No need to start a global cooldown — next target will check
+                    # Also start a visible global cooldown for dashboard display.
+                    stats.start_cooldown(7200)
                     # Auto-remove from targets
                     if config.get("auto_remove_caught", True):
                         if config.get("remove_evolution_line", False):
@@ -1366,8 +1882,62 @@ class PokeBot:
                             encounter_id=enc.get("encounter_id"),
                             is_target=enc_is_target,
                         )
-                    queue.mark_done(task)
-                    print(f"[Worker] {task.pokemon} encountered but result unknown.")
+                    
+                    # Check if we found a shundo — if so, record as caught immediately
+                    # since the user will always catch a shundo. This ensures cooldown
+                    # is set correctly even if the catch line scrolls off the SX dashboard
+                    # before BgScanner can read it.
+                    found_shundo = False
+                    for enc in result.get("new_encounters", []):
+                        if enc.get("shiny", False) and enc.get("iv_percent", 0) == 100:
+                            found_shundo = True
+                            shundo_name = enc.get("pokemon", task.pokemon)
+                            shundo_cp = enc.get("cp")
+                            shundo_iv = enc.get("iv")
+                            break
+                    
+                    if found_shundo:
+                        self.current_activity = f"SHUNDO {display_name(shundo_name)} found! Recording catch for cooldown…"
+                        self.loop_step = 6
+                        stats.record_caught(
+                            shundo_name,
+                            cp=shundo_cp,
+                            iv=shundo_iv,
+                            shiny=True,
+                            iv_percent=100,
+                            encounter_id=None,
+                            coords=coords,
+                            is_target=True,
+                        )
+                        # Notify user about the shundo
+                        notify_id = config.get("notify_user_id")
+                        if notify_id:
+                            try:
+                                user = await self.client.fetch_user(int(notify_id))
+                                if user:
+                                    await self._dm(
+                                        user,
+                                        f"SHUNDO FOUND! {display_name(shundo_name)} — "
+                                        f"{shundo_cp}cp, {shundo_iv}"
+                                    )
+                                    print(f"[Worker] Notified user about shundo {shundo_name}")
+                            except Exception as e:
+                                print(f"[Worker] Failed to send shundo DM: {e}")
+                        # Auto-remove from targets
+                        if config.get("auto_remove_caught", True):
+                            if config.get("remove_evolution_line", False):
+                                self._remove_evolution_line(shundo_name, queue)
+                            else:
+                                config.remove_target(shundo_name)
+                            print(f"[Worker] Auto-removed {shundo_name} from targets (shundo found)")
+                        queue.mark_done(task)
+                        purged = queue.remove_pokemon(shundo_name)
+                        if purged:
+                            print(f"[Worker] Purged {purged} additional queue entries for {shundo_name}")
+                        print(f"[Worker] SHUNDO {shundo_name} recorded as caught! Cooldown will apply to next target.")
+                    else:
+                        queue.mark_done(task)
+                        print(f"[Worker] {task.pokemon} encountered but result unknown.")
 
                 else:
                     # No result — target didn't appear, but log any shinies/hundos
@@ -1420,6 +1990,8 @@ class PokeBot:
     async def close(self):
         """Clean up and close the bot."""
         self.running = False
+        if self._bg_scanner_task and not self._bg_scanner_task.done():
+            self._bg_scanner_task.cancel()
         if self.browser:
             await self.browser.close()
         if not self.client.is_closed():

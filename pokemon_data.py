@@ -8,6 +8,12 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_PATH = os.path.join(SCRIPT_DIR, "pokemon_cache.json")
 STATIC_PATH = os.path.join(SCRIPT_DIR, "pokemon_list.json")
 _pokemon_map = {}  # name (lowercase) -> id (int)
+_pokemon_by_id = {}  # id (int) -> name (lowercase)
+
+
+def _rebuild_by_id():
+    global _pokemon_by_id
+    _pokemon_by_id = {v: k for k, v in _pokemon_map.items()}
 
 
 def _load_static():
@@ -17,6 +23,7 @@ def _load_static():
         try:
             with open(STATIC_PATH, "r") as f:
                 _pokemon_map = {k: int(v) for k, v in json.load(f).items()}
+            _rebuild_by_id()
             print(f"[Pokemon] Loaded {len(_pokemon_map)} Pokemon from static list")
         except Exception as e:
             print(f"[Pokemon] Failed to load static list: {e}")
@@ -37,6 +44,7 @@ def _fetch_from_api():
             fresh[name] = pokemon_id
         if fresh:
             _pokemon_map = fresh
+            _rebuild_by_id()
             with open(CACHE_PATH, "w") as f:
                 json.dump(_pokemon_map, f)
             print(f"[Pokemon] Fetched {len(_pokemon_map)} Pokemon from PokeAPI")
@@ -47,6 +55,7 @@ def _fetch_from_api():
             try:
                 with open(CACHE_PATH, "r") as f:
                     _pokemon_map = {k: int(v) for k, v in json.load(f).items()}
+                _rebuild_by_id()
                 print(f"[Pokemon] Loaded {len(_pokemon_map)} Pokemon from cache")
             except Exception:
                 pass
@@ -75,6 +84,11 @@ def get_sprite_url(name):
 def get_all_pokemon():
     """Return the full Pokemon map (name -> id)."""
     return dict(_pokemon_map)
+
+
+def get_name_by_id(dex_num):
+    """Resolve a Pokedex number to the species name (lowercase). Returns None if unknown."""
+    return _pokemon_by_id.get(int(dex_num))
 
 
 # Load static list first (instant), then try API for updates
