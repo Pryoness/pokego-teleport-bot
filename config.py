@@ -42,6 +42,16 @@ DEFAULTS = {
     "dm_delay_max_seconds": 5,
     "min_dsp_seconds": 120,  # Skip targets with DSP below this (spawn likely gone)
     "device_temp_interval_seconds": 30,  # Seconds between iPad temp reports to the dashboard
+    # ── Channel feeds (watch_channel_id + additional_watch_channels) ──
+    "channel_watch_enabled": True,  # False = ignore all watch channels (list is kept)
+    # ── Guaranteed-shundo DMs from PokeX ──
+    "shundo_dm_enabled": True,
+    "shundo_dm_channel_id": "",  # DM channel with the PokeX bot
+    "pokex_bot_id": "1015817657146159115",
+    "shundo_catch_overhead_seconds": 60,  # teleport+walk+encounter time used by the planner
+    "shundo_monitor_timeout_seconds": 45,  # how long to watch logs after a shundo teleport
+    "shundo_plan_budget_seconds": 5,  # safety time limit for the exact planner
+    "shundo_pause_queue": True,  # pause the regular queue while shundos are pending
 }
 
 

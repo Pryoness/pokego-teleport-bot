@@ -14,3 +14,6 @@ frontend/dist/
 frontend/.project_id
 *.env
 .env*
+shundo_state.json
+shundo_state.json.tmp
+shundo_log.jsonl

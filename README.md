@@ -251,3 +251,14 @@ pokego-teleport-bot/
 ## Warning
 
 Using a personal Discord account token (self-bot) violates Discord's Terms of Service. Use at your own risk. Consider using a secondary account.
+
+## Guaranteed shundos from PokeX DMs (`shundo-dm` branch)
+
+- Reads alerts from the PokeX bot in your DM (`shundo_dm_channel_id`, `pokex_bot_id`), clicks each alert's **Copy** button and captures the ephemeral coordinates reply.
+- Respects `target_pokemon`; an empty target list means every alert is chased.
+- `shundo.py` plans the catch order that catches the most shundos before DSP reaches 0, using the distance cooldown chart (exact search, `shundo_plan_budget_seconds` safety limit). Re-plans after every catch and every new alert; only teleports at cooldown 0.
+- The regular channel queue pauses while shundos are pending (`shundo_pause_queue`).
+- Channel feeds can be switched off without losing the list: `"channel_watch_enabled": false`.
+- Log: `shundo_log.jsonl`. Discord: `@bot shundos` shows the plan.
+
+New config keys: `channel_watch_enabled`, `shundo_dm_enabled`, `shundo_dm_channel_id`, `pokex_bot_id`, `shundo_catch_overhead_seconds` (60), `shundo_monitor_timeout_seconds` (45), `shundo_plan_budget_seconds` (5), `shundo_pause_queue` (true).

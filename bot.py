@@ -11,8 +11,9 @@ import os
 
 from config import config
 from stats import stats, haversine_km
-from queue_manager import queue
+from queue_manager import queue, TargetTask
 from browser import SXBrowser
+from shundo import ShundoManager, parse_alert, parse_coords, species_matches_targets, normalize_species
 from pokemon_data import is_valid_pokemon, get_sprite_url
 
 # Path for channel success rate log
@@ -53,6 +54,11 @@ class PokeBot:
         self._last_encounter_coords = None  # Coords from last BgScanner hundo encounter for catch cooldown
         self._consecutive_no_spawn = 0  # Counter for consecutive no-spawn teleports
         self._last_sx_restart_time = 0  # Timestamp of last SX game restart
+        # Guaranteed-shundo (PokeX DM) state
+        self.shundos = ShundoManager()
+        self._copy_lock = asyncio.Lock()  # Serialize PokeX Copy clicks
+        self._pokex_coord_future = None  # Resolved by the ephemeral coords reply
+        self._shundo_task_counter = 0
         self._load_channel_stats()
         self._setup_events()
 
@@ -92,6 +98,8 @@ class PokeBot:
             # Auto-start background log scanner for passive hundo/shiny tracking
             if self._bg_scanner_task is None or self._bg_scanner_task.done():
                 self._bg_scanner_task = asyncio.create_task(self._background_log_scanner())
+            # Pick up any recent PokeX shundo alerts that arrived while we were offline
+            asyncio.create_task(self._shundo_startup_backfill())
 
         @client.event
         async def on_disconnect():
@@ -123,6 +131,7 @@ class PokeBot:
         print("    @bot stats                      Show statistics")
         print("    @bot caught                     Show caught Pokemon")
         print("    @bot channels                   Show per-channel success rates")
+        print("    @bot shundos                    Show PokeX shundo plan")
         print("    @bot start                      Start monitoring")
         print("    @bot stop                       Stop monitoring")
         print("    @bot status                     Show current status")
@@ -135,6 +144,15 @@ class PokeBot:
 
     async def _on_message(self, message):
         client = self.client
+
+        # PokeX guaranteed-shundo DMs (alerts + ephemeral Copy replies) are handled
+        # separately and never fall through to the channel/Reveal Coords logic.
+        if self._is_pokex_message(message):
+            waiting = self._pokex_coord_future is not None and not self._pokex_coord_future.done()
+            ephemeral = bool(getattr(getattr(message, "flags", None), "ephemeral", False))
+            if self._in_pokex_dm(message) or (waiting and ephemeral):
+                await self._on_pokex_message(message)
+                return
 
         # Check if this is a coordinate response from a "Reveal Coords" button click
         if self._coord_response_future and not self._coord_response_future.done():
@@ -199,14 +217,233 @@ class PokeBot:
                 if parts and parts[0].lower() in (
                     "add", "remove", "targets", "queue", "clear", "stats",
                     "caught", "start", "stop", "status", "set", "help", "priority",
-                    "channels",
+                    "channels", "shundos",
                 ):
                     await self._handle_command(message, parts)
                     return
 
         # If running and in the watch channel, check for target Pokemon keywords
-        if self.running and is_watch_channel:
+        # (channel feeds can be switched off with channel_watch_enabled=false; the
+        # channel list is kept so they can be turned back on later)
+        if self.running and is_watch_channel and config.get("channel_watch_enabled", True):
             await self._check_for_targets(message)
+
+    # ────────────────────── PokeX guaranteed shundos ──────────────────────
+
+    def _is_pokex_message(self, message):
+        if not config.get("shundo_dm_enabled", True):
+            return False
+        bot_id = str(config.get("pokex_bot_id", ""))
+        return bool(bot_id) and str(message.author.id) == bot_id
+
+    def _in_pokex_dm(self, message):
+        dm_id = str(config.get("shundo_dm_channel_id", ""))
+        return bool(dm_id) and str(message.channel.id) == dm_id
+
+    async def _on_pokex_message(self, message):
+        content = message.content or ""
+        # 1) Ephemeral reply to a Copy click -> coordinates
+        if self._pokex_coord_future and not self._pokex_coord_future.done():
+            coords = parse_coords(content)
+            if coords and "<t:" not in content:
+                self._pokex_coord_future.set_result(coords)
+                return
+        # 2) A new alert in the PokeX DM
+        if not self._in_pokex_dm(message):
+            return
+        alert = parse_alert(content)
+        if alert:
+            asyncio.create_task(self._handle_pokex_alert(message, alert))
+
+    async def _handle_pokex_alert(self, message, alert):
+        """Register a shundo alert and fetch its coordinates via the Copy button."""
+        if self.shundos.is_processed(message.id):
+            return
+        self.shundos.mark_processed(message.id)
+        now = time.time()
+        left = int(alert["expires_at"] - now)
+        if left <= 0:
+            print(f"[Shundo] {alert['name']} already despawned — ignoring")
+            return
+        targets = config.get_targets()
+        if not species_matches_targets(alert["species"], targets):
+            print(f"[Shundo] {alert['name']} not in target list — skipping")
+            self.shundos.log("skipped_not_target", dict(alert, msg_id=str(message.id)))
+            return
+        entry = self.shundos.add(message.id, alert, message.channel.id)
+        print(f"[Shundo] Alert: {alert['name']} L{alert['level']} CP{alert['cp']} {alert['city']} — DSP {left // 60}m {left % 60}s")
+        stats.add_event("shundo", f"PokeX shundo alert: {alert['name']} ({alert['city']}, DSP {left // 60}m)")
+        coords = None
+        for attempt in range(2):
+            coords = await self._click_pokex_copy(message)
+            if coords:
+                break
+            await asyncio.sleep(3)
+        if not coords:
+            self.shundos.set_status(message.id, "no_coords")
+            print(f"[Shundo] Could not get coordinates for {alert['name']}")
+            return
+        e = self.shundos.set_coords(message.id, coords)
+        print(f"[Shundo] {alert['name']} coords {coords} ({e['status']})")
+
+    async def _click_pokex_copy(self, message):
+        """Click the PokeX 'Copy' button and wait for the ephemeral coordinates reply."""
+        async with self._copy_lock:
+            button = None
+            for row in message.components or []:
+                for comp in getattr(row, "children", []):
+                    label = getattr(comp, "label", "") or ""
+                    if "copy" in label.lower():
+                        button = comp
+                        break
+                if button:
+                    break
+            if not button:
+                print("[Shundo] No Copy button on alert message")
+                return None
+            loop = asyncio.get_event_loop()
+            self._pokex_coord_future = loop.create_future()
+            try:
+                try:
+                    await button.click()
+                except Exception as e:
+                    print(f"[Shundo] Copy click failed: {e}")
+                    return None
+                try:
+                    return await asyncio.wait_for(self._pokex_coord_future, timeout=15.0)
+                except asyncio.TimeoutError:
+                    print("[Shundo] Timed out waiting for PokeX coordinates")
+                    return None
+            finally:
+                self._pokex_coord_future = None
+                await asyncio.sleep(2)  # be gentle with Discord interactions
+
+    async def _shundo_startup_backfill(self):
+        """On startup, process recent PokeX alerts that haven't despawned yet."""
+        if not config.get("shundo_dm_enabled", True):
+            return
+        dm_id = config.get("shundo_dm_channel_id")
+        if not dm_id:
+            print("[Shundo] shundo_dm_channel_id not set — DM intake disabled")
+            return
+        await asyncio.sleep(5)
+        try:
+            channel = self.client.get_channel(int(dm_id)) or await self.client.fetch_channel(int(dm_id))
+            found = []
+            async for m in channel.history(limit=30):
+                if not self._is_pokex_message(m) or self.shundos.is_processed(m.id):
+                    continue
+                alert = parse_alert(m.content or "")
+                if alert and alert["expires_at"] > time.time() + 60:
+                    found.append((m, alert))
+            if found:
+                print(f"[Shundo] Startup: {len(found)} unexpired PokeX alert(s) to process")
+            for m, alert in reversed(found):  # oldest first
+                await self._handle_pokex_alert(m, alert)
+        except Exception as e:
+            print(f"[Shundo] Startup backfill error: {e}")
+
+    def _make_shundo_task(self, entry):
+        self._shundo_task_counter += 1
+        t = TargetTask(
+            priority=0,
+            expires_at=entry["expires_at"],
+            created_at=entry.get("received_at", time.time()),
+            pokemon=entry["species"],
+            url="",
+            message_id=0,
+            channel_id=entry.get("channel_id", 0),
+            dsp_minutes=max(0, int((entry["expires_at"] - time.time()) // 60)),
+            coords=entry["coords"],
+            status="processing",
+            shiny=True,
+            iv_info="100%",
+            _counter_key=-1000000 - self._shundo_task_counter,  # never collides with queue keys
+        )
+        t.shundo_id = entry["msg_id"]
+        return t
+
+    def _shundo_select(self):
+        """Pick the next shundo per the max-catch plan.
+        Returns (task, coords, wait_info) — task None + wait_info when we must wait for cooldown."""
+        self.shundos.expire()
+        if not self.shundos.pending():
+            return None, None, None
+        plan = self.shundos.plan(
+            stats._data.get("last_catch_coords"),
+            stats._data.get("last_catch_time"),
+            overhead=config.get("shundo_catch_overhead_seconds", 60),
+            budget_s=config.get("shundo_plan_budget_seconds", 5),
+        )
+        if not plan:
+            return None, None, None
+        nxt = plan[0]
+        cd = stats.get_catch_cooldown_for_target(nxt["coords"])
+        if cd > 0:
+            dist = self._distance_from_last_catch(nxt["coords"]) or 0
+            return None, None, (nxt, cd, dist, len(plan))
+        nxt["status"] = "processing"
+        nxt["attempts"] = nxt.get("attempts", 0) + 1
+        return self._make_shundo_task(nxt), nxt["coords"], None
+
+    def _shundo_finish(self, task, mon_status, caught):
+        sid = getattr(task, "shundo_id", None)
+        if not sid:
+            return
+        e = self.shundos.entries.get(sid)
+        if not e:
+            return
+        if caught or e["status"] == "caught":
+            self.shundos.mark_caught(sid)
+            print(f"[Shundo] {e['name']} caught — re-planning from here")
+            return
+        # Not caught: one retry if the spawn simply didn't show up and DSP is left
+        if (mon_status in ("no_result", "found") and e.get("attempts", 0) < 2
+                and e["expires_at"] - time.time() > config.get("shundo_catch_overhead_seconds", 60)):
+            e["status"] = "pending"
+            self.shundos._plan_cache = None
+            self.shundos.log("retry", e, result=mon_status)
+            print(f"[Shundo] {e['name']}: {mon_status} — will retry once")
+        else:
+            self.shundos.set_status(sid, "missed", result=mon_status)
+            print(f"[Shundo] {e['name']}: {mon_status} — marked missed")
+
+    def _shundo_report(self):
+        now = time.time()
+        self.shundos.expire()
+        lines = ["**PokeX Shundos**"]
+        if not config.get("shundo_dm_enabled", True):
+            lines.append("DM intake is disabled (`shundo_dm_enabled`).")
+        plan = self.shundos.plan(stats._data.get("last_catch_coords"), stats._data.get("last_catch_time"),
+                                 overhead=config.get("shundo_catch_overhead_seconds", 60),
+                                 budget_s=config.get("shundo_plan_budget_seconds", 5))
+        if plan:
+            lines.append(f"Plan ({'exact' if self.shundos.last_plan_exhaustive else 'best found'}):")
+            for i, e in enumerate(plan, 1):
+                left = int(e["expires_at"] - now)
+                cd = stats.get_catch_cooldown_for_target(e["coords"])
+                dist = self._distance_from_last_catch(e["coords"]) or 0
+                lines.append(f"{i}. **{e['name']}** — {e['city']} • DSP {left // 60}m • {dist:.0f}km • "
+                             f"{'ready' if cd <= 0 else f'cooldown {cd // 60}m {cd % 60}s'}")
+        else:
+            lines.append("No shundos planned right now.")
+        planned_ids = {e["msg_id"] for e in plan}
+        for e in self.shundos.entries.values():
+            if e["status"] in ("pending_coords", "processing"):
+                lines.append(f"• {e['name']} — {e['status'].replace('_', ' ')}")
+            elif e["status"] == "pending" and e["msg_id"] not in planned_ids:
+                left = int(e["expires_at"] - now)
+                why = "can't reach before DSP ends" if e.get("reachable") is False else "not in best plan"
+                lines.append(f"• {e['name']} ({e['city']}) — {why} • DSP {left // 60}m")
+        recent = sorted([e for e in self.shundos.entries.values()
+                         if e["status"] in ("caught", "missed", "expired", "already_caught", "no_coords")],
+                        key=lambda e: -e.get("received_at", 0))[:8]
+        if recent:
+            lines.append("Recent:")
+            for e in recent:
+                lines.append(f"• {e['name']} ({e['city']}) — {e['status'].replace('_', ' ')}")
+        lines.append(f"Channel feeds: {'on' if config.get('channel_watch_enabled', True) else 'off'}")
+        return "\n".join(lines)[:1900]
 
     def _load_channel_stats(self):
         """Load per-channel success rate stats from disk."""
@@ -267,6 +504,7 @@ class PokeBot:
                 "`@bot stats` - Show statistics\n"
                 "`@bot caught` - Show caught Pokemon\n"
                 "`@bot channels` - Show per-channel success rates\n"
+                "`@bot shundos` - Show pending PokeX shundos and the catch plan\n"
                 "`@bot start` - Start monitoring\n"
                 "`@bot stop` - Stop monitoring\n"
                 "`@bot status` - Show current status\n"
@@ -460,6 +698,9 @@ class PokeBot:
                     await self._send(message.channel, "Usage: `@bot priority <pokemon> high/low`")
             else:
                 await self._send(message.channel, "Usage: `@bot priority <pokemon> high/low`")
+
+        elif cmd == "shundos":
+            await self._send(message.channel, self._shundo_report())
 
         elif cmd == "channels":
             """Show per-channel encounter success rates."""
@@ -1098,6 +1339,13 @@ class PokeBot:
                                         print(f"[BgScanner] Auto-removed {caught_name} from targets (caught)")
                             except Exception as e:
                                 print(f"[BgScanner] Error removing caught target: {e}")
+                            # Cross-reference with pending PokeX shundos (marks caught + triggers re-plan)
+                            try:
+                                hit = self.shundos.mark_caught_by_name(caught_name, coords)
+                                if hit:
+                                    print(f"[Shundo] Catch matched PokeX alert: {hit['name']} ({hit['city']})")
+                            except Exception as e:
+                                print(f"[Shundo] Catch cross-reference error: {e}")
                             print(f"[BgScanner] Catch detected: {caught_name} (cp={nt_cp}, iv={nt_iv}, shiny={nt_shiny}, coords={coords}) — cooldown started")
                         continue  # Don't also process as encounter
 
@@ -1189,6 +1437,18 @@ class PokeBot:
 
         Returns (task, coords) or (None, None).
         """
+        # Guaranteed shundos (PokeX DMs) always come first, following the max-catch plan.
+        self._shundo_wait = None
+        if config.get("shundo_dm_enabled", True):
+            s_task, s_coords, s_wait = self._shundo_select()
+            if s_task:
+                return s_task, s_coords
+            self._shundo_wait = s_wait
+            # While any shundo is pending, keep the regular queue paused so a
+            # regular catch can't move the catch location and break the plan.
+            if config.get("shundo_pause_queue", True) and self.shundos.has_active():
+                return None, None
+
         all_tasks = queue.peek_all()
         if not all_tasks:
             return None, None
@@ -1410,7 +1670,7 @@ class PokeBot:
                 expired = queue.cleanup_expired()
                 for exp_task in expired:
                     print(f"[Worker] Expired: {exp_task.pokemon}")
-                    stats.record_expired(exp_task)
+                    stats.record_expired(exp_task.pokemon)
 
                 # Cleanup targets below min DSP — remove before they're selected
                 min_dsp = config.get("min_dsp_seconds", 120)
@@ -1418,6 +1678,14 @@ class PokeBot:
                 for bd_task in below_dsp:
                     print(f"[Worker] Removed {bd_task.pokemon} from queue — DSP {bd_task.remaining_minutes}m below min ({min_dsp}s)")
                     stats.record_expired(bd_task.pokemon)
+
+                # Shundo housekeeping: nothing is mid-processing at the top of the loop,
+                # so any 'processing' entry was left by an early exit (skip/error) — requeue it.
+                for _e in self.shundos.entries.values():
+                    if _e["status"] == "processing":
+                        _e["status"] = "pending" if _e.get("attempts", 0) < 3 else "missed"
+                        self.shundos._plan_cache = None
+                self.shundos.expire()
 
                 # Purge expired tasks before selecting
                 self._purge_expired_tasks()
@@ -1430,8 +1698,22 @@ class PokeBot:
                         idle_since = time.time()
                     idle_secs = int(time.time() - idle_since)
                     
-                    self.current_activity = "Waiting for targets in channel…"
-                    self.loop_step = 1
+                    sw = getattr(self, "_shundo_wait", None)
+                    if sw:
+                        nxt, cd, dist, n_plan = sw
+                        self.current_coords = nxt["coords"]
+                        self.current_activity = (f"Shundo cooldown — {nxt['name']}: {cd // 60}m {cd % 60}s "
+                                                 f"({dist:.0f}km) • {n_plan} planned")
+                        self.loop_step = 6
+                    elif self.shundos.has_active():
+                        self.current_activity = "Getting shundo coordinates from PokeX…"
+                        self.loop_step = 2
+                    elif not config.get("channel_watch_enabled", True):
+                        self.current_activity = "Waiting for PokeX shundo alerts…"
+                        self.loop_step = 1
+                    else:
+                        self.current_activity = "Waiting for targets in channel…"
+                        self.loop_step = 1
                     # Heartbeat every 30 seconds so we know the bot is alive
                     heartbeat_counter += 1
                     if heartbeat_counter % 30 == 0:
@@ -1457,7 +1739,9 @@ class PokeBot:
                         
                         # Channel backfill: if idle for 5+ minutes, scan recent channel messages
                         # for missed targets (messages posted while bot was busy or restarting)
-                        if idle_secs >= backfill_interval and (time.time() - last_backfill) >= backfill_interval:
+                        if (config.get("channel_watch_enabled", True)
+                                and idle_secs >= backfill_interval
+                                and (time.time() - last_backfill) >= backfill_interval):
                             print(f"[Worker] Queue empty for {idle_secs//60}m — backfilling from recent channel messages…")
                             last_backfill = time.time()
                             # Run backfill as a background task so the worker loop
@@ -1494,6 +1778,16 @@ class PokeBot:
                 # but if ALL targets are in cooldown, we should NOT claim one and wait.
                 # Instead, release the task and wait briefly for new catchable targets.
                 cooldown_remaining = stats.get_catch_cooldown_for_target(coords)
+                if cooldown_remaining > 0 and getattr(task, "shundo_id", None):
+                    # Shundo tasks are only handed out at cooldown 0; if a catch just
+                    # landed in between, put it back and let the planner re-decide.
+                    e = self.shundos.entries.get(task.shundo_id)
+                    if e and e["status"] == "processing":
+                        e["status"] = "pending"
+                        e["attempts"] = max(0, e.get("attempts", 1) - 1)
+                        self.shundos._plan_cache = None
+                    await asyncio.sleep(1)
+                    continue
                 if cooldown_remaining > 0:
                     # Release the task — don't hold it while waiting
                     queue.release(task)
@@ -1613,6 +1907,8 @@ class PokeBot:
 
                 # Monitor logs for catch/fled (only NEW lines since fresh baseline)
                 monitor_timeout = config.get("monitor_timeout_seconds", 35)
+                if getattr(task, "shundo_id", None):
+                    monitor_timeout = config.get("shundo_monitor_timeout_seconds", 45)
                 print(f"[Worker] Monitoring logs for {task.pokemon} (timeout: {monitor_timeout}s)")
                 self.current_activity = f"Monitoring logs for {display_name(task.pokemon)}… (0s/{monitor_timeout}s)"
                 self.loop_step = 5
@@ -1957,6 +2253,13 @@ class PokeBot:
                     queue.mark_done(task)
                     print(f"[Worker] No log result for {task.pokemon} after {monitor_timeout}s — moving to next target")
 
+                if getattr(task, "shundo_id", None):
+                    shundo_caught = bool(result.get("caught")) or any(
+                        enc.get("shiny") and enc.get("iv_percent", 0) == 100
+                        and normalize_species(enc.get("pokemon", "")) == task.pokemon
+                        for enc in result.get("new_encounters", [])
+                    )
+                    self._shundo_finish(task, mon_status, shundo_caught)
                 print(f"[Worker] Target {task.pokemon} done — checking queue for next catchable target")
 
             except Exception as e:

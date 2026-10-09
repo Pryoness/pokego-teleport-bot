@@ -10,8 +10,8 @@ from collections import defaultdict
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 STATS_PATH = os.path.join(SCRIPT_DIR, "stats.json")
 MAX_EVENTS = 200
-MAX_DEDUP_LOGGED = 10000  # Max encounter IDs to keep in memory
-MAX_DEDUP_SAVE = 10000    # Max encounter IDs to persist to disk
+MAX_DEDUP_LOGGED = 50000  # Max encounter IDs to keep in memory (~1250h at 40/hr)
+MAX_DEDUP_SAVE = 50000    # Max encounter IDs to persist to disk
 MAX_TIMESTAMPS = 5000    # Max timestamps per type (enough for ~125hrs at 40/hr)
 
 # Cooldown chart: (min_distance_km, cooldown_seconds)
@@ -78,8 +78,10 @@ class StatsTracker:
     def __init__(self):
         self._lock = threading.RLock()
         self._data = self._default()
-        self._logged_encounter_ids = set()  # Dedup by encounter_id
-        self._caught_encounter_ids = set()  # Separate dedup for catches
+        # Insertion-ordered (dict) so trimming always drops the OLDEST ids
+        self._logged_encounter_ids = {}  # Dedup by encounter_id
+        self._caught_encounter_ids = {}  # Separate dedup for catches
+        self._dedup_dirty = 0
         self._is_running = False
         self.load()
         self._load_dedup_ids()
@@ -167,8 +169,8 @@ class StatsTracker:
             if os.path.exists(dedup_path):
                 with open(dedup_path, "r") as f:
                     data = json.load(f)
-                self._logged_encounter_ids = set(data.get("logged", []))
-                self._caught_encounter_ids = set(data.get("caught", []))
+                self._logged_encounter_ids = dict.fromkeys(data.get("logged", []))
+                self._caught_encounter_ids = dict.fromkeys(data.get("caught", []))
                 print(f"[Stats] Loaded {len(self._logged_encounter_ids)} logged + {len(self._caught_encounter_ids)} caught dedup IDs from disk")
         except Exception as e:
             print(f"[Stats] Warning: could not load dedup IDs: {e}")
@@ -262,12 +264,14 @@ class StatsTracker:
                 if encounter_id in self._logged_encounter_ids:
                     print(f"[Stats] Dedup: encounter {encounter_id} ({pokemon}) already logged — skipping")
                     return  # Already logged this encounter
-                self._logged_encounter_ids.add(encounter_id)
-                if len(self._logged_encounter_ids) > MAX_DEDUP_LOGGED:
-                    # Keep only recent IDs to prevent unbounded growth
-                    self._logged_encounter_ids = set(list(self._logged_encounter_ids)[-MAX_DEDUP_SAVE:])
-                # Persist dedup IDs every 10 encounters
-                if len(self._logged_encounter_ids) % 10 == 0:
+                self._logged_encounter_ids[encounter_id] = None
+                while len(self._logged_encounter_ids) > MAX_DEDUP_LOGGED:
+                    # Drop the oldest id (dicts keep insertion order)
+                    self._logged_encounter_ids.pop(next(iter(self._logged_encounter_ids)))
+                # Persist dedup IDs every 10 new encounters
+                self._dedup_dirty += 1
+                if self._dedup_dirty >= 10:
+                    self._dedup_dirty = 0
                     self._save_dedup_ids()
             now = time.time()
             name = pokemon.lower()
@@ -335,7 +339,9 @@ class StatsTracker:
                     print(f"[Stats] Dedup: catch {encounter_id} ({pokemon}) already logged — skipping")
                     self.save()
                     return  # Already counted in stats
-                self._caught_encounter_ids.add(encounter_id)
+                self._caught_encounter_ids[encounter_id] = None
+                while len(self._caught_encounter_ids) > MAX_DEDUP_LOGGED:
+                    self._caught_encounter_ids.pop(next(iter(self._caught_encounter_ids)))
                 if len(self._caught_encounter_ids) % 10 == 0:
                     self._save_dedup_ids()
             name = pokemon.lower()
@@ -397,6 +403,9 @@ class StatsTracker:
         self.save()
 
     def record_expired(self, pokemon):
+        # Accept either a name or a TargetTask (worker passes tasks from cleanup_expired)
+        if not isinstance(pokemon, str):
+            pokemon = getattr(pokemon, "pokemon", None) or str(pokemon)
         with self._lock:
             display = pokemon.replace("-", " ").title()
             self._data["total_expired"] += 1
