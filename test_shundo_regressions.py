@@ -39,6 +39,19 @@ class AlertTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(species_matches_targets("wooloo", ["surskit"], ["surskit"]))
         self.assertFalse(species_matches_targets("surskit", ["surskit"], ["surskit"]))
 
+    def test_pumpkaboo_gourgeist_sizes_collapse(self):
+        from shundo import normalize_species, base_species
+        import pokemon_data
+        for size in ("Small", "Average", "Large", "Super", "Super Size"):
+            self.assertEqual(normalize_species(f"Pumpkaboo {size}"), "pumpkaboo")
+            self.assertEqual(base_species(f"gourgeist-{size}"), "gourgeist")
+            self.assertFalse(species_matches_targets(normalize_species(f"Pumpkaboo {size}"), [], ["pumpkaboo-average"]))
+            self.assertEqual(pokemon_data.get_pokemon_id(f"pumpkaboo-{size.lower()}"), 710)
+            self.assertEqual(pokemon_data.get_pokemon_id(f"gourgeist-{size.lower()}"), 711)
+        self.assertEqual(pokemon_data.get_name_by_id(710), "pumpkaboo")
+        self.assertEqual(pokemon_data.get_name_by_id(711), "gourgeist")
+        self.assertTrue(species_matches_targets("pikachu", [], ["pumpkaboo"]))
+
     async def test_resolver_fetches_only_linked_message(self):
         bot = object.__new__(PokeBot)
         button = NS(label="Copy", click=AsyncMock())

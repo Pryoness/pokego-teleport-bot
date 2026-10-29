@@ -61,21 +61,42 @@ def _fetch_from_api():
                 pass
 
 
+_SIZED = ("pumpkaboo", "gourgeist")
+
+
+def _canon(name):
+    """'pumpkaboo-small' / 'Pumpkaboo Super Size' -> 'pumpkaboo' (sizes are not differentiated)."""
+    n = (name or "").lower().strip()
+    for base in _SIZED:
+        if n == base or n.startswith(base + "-") or n.startswith(base + " "):
+            return base
+    return n
+
+
+def _collapse_sizes():
+    global _pokemon_map
+    m = {}
+    for k, v in _pokemon_map.items():
+        m.setdefault(_canon(k), v)
+    _pokemon_map = m
+    _rebuild_by_id()
+
+
 def is_valid_pokemon(name):
     """Check if a name is a valid Pokemon. Returns False if list is empty."""
     if not _pokemon_map:
         return False  # Strict: reject if data isn't loaded
-    return name.lower() in _pokemon_map
+    return _canon(name) in _pokemon_map
 
 
 def get_pokemon_id(name):
     """Get the PokeAPI ID for a Pokemon."""
-    return _pokemon_map.get(name.lower())
+    return _pokemon_map.get(_canon(name))
 
 
 def get_sprite_url(name):
     """Get the sprite URL for a Pokemon."""
-    pid = _pokemon_map.get(name.lower())
+    pid = _pokemon_map.get(_canon(name))
     if pid:
         return f"https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/{pid}.png"
     return None
@@ -94,3 +115,4 @@ def get_name_by_id(dex_num):
 # Load static list first (instant), then try API for updates
 _load_static()
 _fetch_from_api()
+_collapse_sizes()

@@ -38,7 +38,11 @@ def normalize_species(name):
     """'Flabébé' -> 'flabebe', 'Mr. Mime' -> 'mr-mime'."""
     s = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode()
     s = re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
-    return s
+    return _SIZED_RE.sub(r"\1", s)
+
+
+# Pumpkaboo / Gourgeist sizes are treated as one species (SX logs show only "Pumpkaboo (#710)")
+_SIZED_RE = re.compile(r"^(pumpkaboo|gourgeist)(?:-(?:small|average|large|super|size))+$")
 
 
 _FORM_SUFFIXES = ("-alola", "-alolan", "-galar", "-galarian", "-hisui", "-hisuian", "-paldea", "-paldean")
